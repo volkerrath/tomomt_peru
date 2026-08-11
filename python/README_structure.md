@@ -134,7 +134,7 @@ inclusion; none are guessed.
 
 ## Configuration
 
-- `SITE_PREFIX` — `"tacna"`/`"saba"`, must match `interpolate.py`.
+- `SITE_PREFIX` — your site's short code (e.g. `"site_a"`), must match `interpolate.py`.
 - `INTERP_FILE` — explicit path, or `None` to auto-pick the newest
   `{SITE_PREFIX}_interp_*.nc` in the current directory.
 - `STRUCTURE_PAIRS` — list of `(field_a, field_b, label)` tuples for the
@@ -204,7 +204,7 @@ clear `ValueError` if `INTERP_FILE` isn't a `"joint"`-mode grid. Re-run
 ## Three known integration seams (by design, not oversight)
 
 1. **Basemap/marker/label styling.** This script does its own minimal
-   `pcolormesh` plotting rather than calling into `plotpy.py`'s
+   `pcolormesh` plotting rather than calling into `tomomt.py`'s
    `build_panel_figure`/`finish_panel_colorbar`/`draw_north_arrow`/
    `add_latlon_ticks`/`clipped_markers`/`clipped_labels`, since their exact
    current signatures weren't available to verify against here. Swapping

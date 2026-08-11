@@ -63,7 +63,7 @@ tuned default — check it against your actual grid sizes.
 
 ## Configuration
 
-- `SITE_PREFIX` — `"tacna"`/`"saba"`, must match `interpolate.py`.
+- `SITE_PREFIX` — your site's short code (e.g. `"site_a"`), must match `interpolate.py`.
 - `INTERP_FILE` — explicit path, or `None` to auto-pick the newest
   `{SITE_PREFIX}_interp_*.nc` in the current directory.
 - `CROSSPLOT_PAIRS` — list of `(field_a, field_b, color_by, label)`
@@ -122,7 +122,7 @@ not attempted here since no specific sub-area was requested.
 `structure.py`. That's intentional, matching this project's existing
 per-script self-containment pattern — each plotting script in the
 pipeline (`structure.py`, `plot_joint.py`, `cluster.py`, ...) owns its
-own copy of this small grid-loading boilerplate; only `plotpy.py` and
+own copy of this small grid-loading boilerplate; only `tomomt.py` and
 `modem.py` are actual shared modules. Not introducing a new shared
 import here keeps this script consistent with that pattern rather than
 being a one-off exception.

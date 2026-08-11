@@ -159,21 +159,14 @@ Three integration seams, flagged rather than guessed at:
 Authors: Svetlana Byrdina (SMB), Volker Rath (DIAS)
 """
 
-import glob
-import os
-import re
-import shutil
-import zipfile
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import xarray as xr
 from matplotlib.colors import Normalize
 from scipy.interpolate import RegularGridInterpolator
+
+import tomomt
 
 # ---------------------------------------------------------------------------
 # Site / interpolated-grid selection
@@ -298,8 +291,6 @@ ISO_LINEWIDTH = 0.6
 
 OUTPUT_DIR = "../plots_structure/"
 FIG_DPI = 600
-PARIS_TZ = ZoneInfo("Europe/Paris")
-
 # Output formats: list of matplotlib-supported extensions (e.g. "png",
 # "pdf", "svg"). save_paris() renders/saves once per format and returns
 # a list of paths -- call sites use saved.extend(...) accordingly.
@@ -324,90 +315,36 @@ INTERP_TAG = "-"
 # Interpolation-tag derivation (mirrors plot_joint.py's _derive_interp_tag)
 # ===========================================================================
 
+# ===========================================================================
+# Thin wrappers around tomomt's shared helpers, each supplying this
+# script's own globals -- same pattern plot_joint.py already uses for
+# plotpy (now tomomt). See tomomt.py's module docstring for what moved
+# here from and why; _title_suffix()/_region()-style config closures that
+# don't generalise cleanly across scripts stayed local by design.
+# ===========================================================================
+
 def _derive_interp_tag(interp_file):
-    """
-    Pull the interpolation-method tag out of an INTERP_FILE name of the
-    form '..._interp_<method>.nc' (e.g. 'saba_interp_krig.nc' -> 'krig').
-    Falls back to 'unknown' if the pattern isn't found, rather than
-    raising -- this script should still run against oddly named files.
-    """
-    m = re.search(r"_interp_([A-Za-z0-9]+)\.nc$", str(interp_file))
-    return m.group(1) if m else "unknown"
+    return tomomt.derive_interp_tag(interp_file)
 
 
 def _resolve_interp_file():
-    if INTERP_FILE is not None:
-        return INTERP_FILE
-    candidates = sorted(glob.glob(f"{SITE_PREFIX}_interp_*.nc"))
-    if not candidates:
-        raise FileNotFoundError(
-            f"No {SITE_PREFIX}_interp_*.nc found in the current directory; "
-            f"set INTERP_FILE explicitly."
-        )
-    return candidates[-1]
+    return tomomt.resolve_interp_file(SITE_PREFIX, INTERP_FILE)
 
 
 def _title_suffix():
-    return [SITE_PREFIX, INTERP_TAG]
+    return tomomt.title_suffix(SITE_PREFIX, INTERP_TAG)
 
 
 def _group_label(fields, label):
-    return label if label else "-".join(fields)
+    return tomomt.group_label(fields, label)
 
 
 def _maybe_show(fig):
-    """
-    Show `fig` on screen only if both SHOW_PLOTS is True and matplotlib
-    is actually running with an interactive backend (Spyder GUI, etc.) --
-    an unconditional plt.show() blocks or errors in terminals, batch
-    jobs, and headless cluster (DIAS HPC) environments. Mirrors
-    plot_joint.py's SHOW_PLOTS/_maybe_show() fix for the same issue.
-    """
-    if SHOW_PLOTS and matplotlib.is_interactive():
-        plt.show()
+    tomomt.maybe_show(SHOW_PLOTS)
 
 
-# ===========================================================================
-# Grid loading
-# ===========================================================================
-
-def load_joint_grid(interp_file):
-    """
-    Load INTERP_FILE and confirm it is a genuinely regular UTM-km grid
-    (TARGET_GRID == "joint" in interpolate.py), i.e. 1-D depth/northing/
-    easting coordinate arrays rather than 2-D aux coords. Raises with a
-    clear message otherwise -- see module docstring for why the
-    "seismic" native-grid mode is out of scope here.
-    """
-    ds = xr.open_dataset(interp_file)
-
-    grid_mode = ds.attrs.get("target_grid", None)
-    has_1d_coords = all(
-        name in ds.coords and ds.coords[name].ndim == 1
-        for name in ("depth", "northing", "easting")
-    )
-    if grid_mode == "seismic" or not has_1d_coords:
-        raise ValueError(
-            f"{interp_file} is not a regular 'joint' UTM grid "
-            f"(target_grid={grid_mode!r}). structure.py only supports "
-            f"TARGET_GRID='joint' -- see module docstring. Re-run "
-            f"interpolate.py with TARGET_GRID='joint' to produce a "
-            f"compatible INTERP_FILE."
-        )
-    return ds
-
-
-def get_field(ds, key):
-    if key not in ds.data_vars:
-        raise KeyError(
-            f"Field '{key}' not found in {ds.encoding.get('source', 'INTERP_FILE')}; "
-            f"available fields: {sorted(ds.data_vars)}"
-        )
-    depth = ds.coords["depth"].values
-    northing = ds.coords["northing"].values
-    easting = ds.coords["easting"].values
-    values = ds[key].transpose("depth", "northing", "easting").values.astype(float)
-    return values, depth, northing, easting
+load_joint_grid = tomomt.load_joint_grid
+get_field = tomomt.get_field
 
 
 # ===========================================================================
@@ -723,7 +660,7 @@ def plot_map(cg, depth_km, group_label, quantity_key):
     Depth-slice map of one quantity for one field group.
 
     Styling note (integration seam 1): this does its own minimal
-    pcolormesh plotting rather than calling into plotpy.py's
+    pcolormesh plotting rather than calling into tomomt.py's
     build_panel_figure / finish_panel_colorbar / draw_north_arrow /
     add_latlon_ticks / clipped_markers / clipped_labels, since their
     exact current signatures weren't available to verify against here.
@@ -862,44 +799,17 @@ def plot_section(cg, vslice, group_label, quantity_key):
 
 def save_paris(fig, stem, outdir):
     """
-    Save `fig` once per format in PLOT_FORMATS (e.g. ["png"], or
-    ["png", "pdf"]), each with its mtime set to now in Europe/Paris local
-    time. Optionally shows the figure first (see SHOW_PLOTS/_maybe_show).
-    Returns a list of the saved paths -- call sites use
-    ``saved.extend(save_paris(...))``, not ``.append(...)``.
+    Save `fig` once per format in PLOT_FORMATS, each with its mtime set
+    to now in Europe/Paris local time. Shows the figure first if
+    SHOW_PLOTS (see _maybe_show). Returns a list of the saved paths --
+    call sites use ``saved.extend(save_paris(...))``, not ``.append(...)``.
     """
     _maybe_show(fig)
-    ts = datetime.now(PARIS_TZ).timestamp()
-    paths = []
-    for fmt in PLOT_FORMATS:
-        path = Path(outdir) / f"{stem}.{fmt}"
-        fig.savefig(path, dpi=FIG_DPI)
-        os.utime(path, (ts, ts))
-        paths.append(path)
-    plt.close(fig)
-    return paths
+    return tomomt.save_paris(fig, stem, outdir, PLOT_FORMATS, FIG_DPI)
 
 
 def zip_outputs(paths, project_name="structure"):
-    """
-    Bundle the given output files into a single zip named
-    <project_name>_YYYYMMDD_HHMM.zip (Paris time), with each member's
-    internal mtime also set to the Paris-local packaging time -- same
-    convention as the rest of the pipeline's deliverables.
-    """
-    now_paris = datetime.now(PARIS_TZ)
-    zip_name = f"{project_name}_{now_paris.strftime('%Y%m%d_%H%M')}.zip"
-    zip_path = Path(OUTPUT_DIR) / zip_name
-    date_time = now_paris.timetuple()[:6]
-
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in paths:
-            p = Path(p)
-            zi = zipfile.ZipInfo(p.name, date_time=date_time)
-            zi.compress_type = zipfile.ZIP_DEFLATED
-            with open(p, "rb") as f:
-                zf.writestr(zi, f.read())
-    return zip_path
+    return tomomt.zip_outputs(paths, project_name, OUTPUT_DIR)
 
 
 # ===========================================================================

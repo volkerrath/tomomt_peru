@@ -1,0 +1,2286 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+plot_modem_mesh.py
+========================
+Companion plotting script for precompute.py.
+
+Produces depth-slice maps and vertical cross-sections of log10(ρ) (or
+linear ρ) from a ModEM 3-D MT inversion result. Reads
+the UTM-km NetCDF files produced by precompute.py; no
+GMT/PyGMT required.
+
+Exact mesh rendering
+---------------------
+ModEM meshes are non-uniform (dx/dy/dz grow geometrically in the padding
+cells outside the fine core region), so this script never resamples the
+model onto a uniform pixel grid or interpolates/blends values across cell
+boundaries. Every figure is a true, unblended cut through the mesh's own
+cells, using the exact cell-edge geometry from modem_grid_edges_utm.nc
+(written by precompute.py):
+* Depth slices: pcolormesh(easting_edges, northing_edges, field,
+  shading="flat") — each rendered patch is exactly one real mesh cell, at
+  its true position and true size.
+* Vertical sections: the profile line is intersected with the mesh's own
+  grid lines to find the exact sequence of cells it actually crosses (see
+  compute_vertical_slice_modem) — each rendered patch is one real 3-D
+  cell's value, with true along-profile and true depth boundaries. No
+  RegularGridInterpolator, no resampling.
+
+Shares the same basemap engine (topo hillshade, ocean fill, feature overlays,
+colourbar placement, clipping) as plot_seis.py.  The main differences
+are:
+
+* Data overlay: log10(ρ) depth slices from modem_rho_utm_{D}km.nc
+  instead of seismic-velocity grids.
+* Sensitivity-based shading/blanking: if precompute.py found a
+  .sns sensitivity/resolution file, modem_sens_utm.nc /
+  modem_sens_utm_{D}km.nc are used to blank (NaN) and/or shade
+  poorly-resolved cells on both the horizontal slices and the vertical
+  sections — see USE_SENSITIVITY, SENS_BLANK_THRESHOLD, SENS_SHADE_RANGE.
+* MT sites: read from modem_sites_utm.nc (produced by the precompute script)
+  instead of a plain CSV — avoids redundant coordinate conversion.
+* No seismicity depth-window loop: a single seismicity catalogue depth filter
+  per slice, controlled by ZMIN_SEISM / ZMAX_SEISM lists.
+* Topo NetCDF: modem_topo_utm.nc (elevation in metres, positive up,
+  dims northing/easting) produced by the ModEM precompute script.
+* No bathymetry file is required from the precompute script; the seis-pipeline
+  bath grid ({SITE_PREFIX}_bath_utm.nc) can be reused if available, otherwise the
+  ocean fill is skipped gracefully.
+
+Dependencies
+------------
+    numpy, matplotlib, xarray, pandas, pyproj, scipy
+
+Authors: Svetlana Byrdina (SMB) & Volker Rath (DIAS)
+AI-assisted development: Claude (Anthropic), 2026-06-29.
+License: GNU General Public License v3 (GPL-3.0-or-later).
+AI-generated code — review before use in production.
+"""
+
+import warnings
+import os
+import sys
+
+import numpy as np
+import xarray as xr
+import pandas as pd
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import matplotlib.ticker
+from matplotlib.path import Path as MplPath
+from scipy.interpolate import RegularGridInterpolator
+
+import tomomt
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+
+# ---------------------------------------------------------------------
+# Colormap import helper (matplotlib name / GMT .cpt file / plain RGB(A)
+# file) — see tomomt.load_colormap for the full docstring.
+# ---------------------------------------------------------------------
+load_colormap = tomomt.load_colormap
+export_colormap_to_cpt = tomomt.export_colormap_to_cpt
+
+
+# =====================================================================
+# USER SETTINGS
+# =====================================================================
+
+# --- Site selector ---
+# Must match SITE_PREFIX in precompute.py / interpolate.py. Note: unlike
+# the seismic-tomography outputs, precompute.py's ModEM (Part A) outputs
+# (modem_*.nc) are NOT site-prefixed — only one site's ModEM mesh can
+# live in NC_DIR at a time (selected via precompute.py's own MODEL_FILE/
+# DATA_FILE, not by this setting). SITE_PREFIX here only affects the
+# seismic-pipeline bath/topo grid reused for the ocean fill (NC_BATH/
+# NC_TOPO_SEIS below) and this script's own output filenames — it does
+# NOT need to match whichever site precompute.py's ModEM part was run
+# for, though normally it should.
+SITE_PREFIX = "tacna"
+# SITE_PREFIX = "saba"  # SABA — see the note above MAP_XLIM/MAP_YLIM
+# further down: this script's region/profile/arrow settings have not
+# been re-verified for Sabancaya.
+
+# Directory to read precomputed NetCDF files from (must match OUTPUT_DIR
+# in precompute.py). Default "." reads from the current
+# directory, matching the previous (fixed) behaviour.
+NC_DIR = "../precompute/"
+
+# Directory for saved figures (created if it doesn't exist). Default "."
+# writes into the current directory, matching the previous behaviour.
+PLOT_DIR = "../plots_mt/"
+
+# Appended to every saved figure's filename (before the extension) — lets
+# output from this script (exact-mesh rendering) be told apart at a
+# glance from plot_modem_image.py's resampled output, e.g.
+# "modem_rho_1km_saba_msh.pdf" vs "..._img.pdf". Set to "" to disable.
+PLOT_FILENAME_SUFFIX = "_msh"
+
+PLOT_FORMATS = [".pdf", ".jpg"]
+PLOT_DPI = 600
+
+# Whether to also display each figure on screen after saving it (in
+# addition to always writing PLOT_FORMATS to disk). Previously this
+# script called plt.show() unconditionally, which is only harmless in an
+# environment that keeps a live GUI event loop open between calls (e.g.
+# Spyder's own console). Run the same script from a plain terminal, a
+# batch job, or the DIAS cluster and plt.show() either blocks waiting on
+# a display that will never advance, or errors outright on a machine
+# with no display at all -- neither of which has anything to do with
+# whether the figures themselves were produced correctly. SHOW_PLOTS
+# defaults to False so headless/batch runs "just work"; _maybe_show()
+# below additionally only calls plt.show() when matplotlib is actually
+# running an interactive backend, so turning this on is still safe if
+# the script happens to run somewhere headless.
+SHOW_PLOTS = False
+
+# Figure sizes (cm).
+# Horizontal maps: FIG_WIDTH controls the *map panel's* width only.
+# FIG_HEIGHT is always derived from it and the UTM data aspect ratio —
+# there is no manual height override — so 1 km in easting always renders
+# as exactly the same length as 1 km in northing, guaranteed by
+# construction (see create_map_figure()), not merely by an aspect setting
+# a colorbar could throw off.
+FIG_WIDTH = 10.0  # cm — map panel width; a colorbar (if shown) adds its
+# own extra width/height beyond this, never competing
+# with the map for space.
+# VSLICE_WIDTH_CM  = 14.0
+# VSLICE_HEIGHT_CM = None  # None → derived from VE and profile length
+VSLICE_WIDTH_CM  = None
+VSLICE_HEIGHT_CM =10.  # N
+
+# Depth slices to plot — must match values used in precompute.py.
+# Each entry corresponds to one DEPTH_SLICES_KM value; tag strings are
+# constructed the same way as in the precompute script.
+DEPTH_SLICES_KM = [1.0, 5.0, 9.0]
+
+# Seismicity depth windows (km), one pair per entry in DEPTH_SLICES_KM.
+# Set both to None to show all seismicity on every slice.
+# Contiguous, non-overlapping bins split at the midpoint between adjacent
+# slice depths (1, 5, 9 km -> split at 3 and 7 km), so every earthquake
+# is assigned to exactly one slice — the one closest to its own depth —
+# rather than showing everything on every map or leaving gaps. The
+# outermost bins are left open (None) so no shallow/deep event is
+# arbitrarily excluded. Same scheme as ZMIN_SEISM/ZMAX_SEISM in
+# plot_seis.py and plot_modem_image.py.
+ZMIN_SEISM = [None, 3.0, 7.0]
+ZMAX_SEISM = [3.0, 7.0, None]
+
+if not (len(ZMIN_SEISM) == len(ZMAX_SEISM) == len(DEPTH_SLICES_KM)):
+    sys.exit(
+        f"ZMIN_SEISM ({len(ZMIN_SEISM)}), ZMAX_SEISM ({len(ZMAX_SEISM)}), "
+        f"and DEPTH_SLICES_KM ({len(DEPTH_SLICES_KM)}) must all be the same "
+        f"length — one seismicity depth-window pair per depth slice. Pad "
+        f"the shorter list(s) with None (= show all seismicity) for any "
+        f"slice that doesn't need a filter."
+    )
+
+# Colour-scale limits for log10(ρ) [Ω·m]; adjust to your model range
+CMIN_RHO = 0.0  # log10(Ω·m) — ~3 Ω·m
+CMAX_RHO = 3.0  # log10(Ω·m) — ~10,000 Ω·m
+
+# Air cells above the model surface are stored with RHO_AIR (~1e17 Ω·m,
+# i.e. log10(ρ) ≈ 17) in precompute.py. Any cell at or above this
+# threshold is treated as air/no-data and masked to NaN — independent of
+# CMIN_RHO/CMAX_RHO, so changing the display colour range never re-exposes
+# the air layer. Used for both the horizontal depth slices and the vertical
+# sections.
+AIR_LOG10_RHO_THRESHOLD = 10.0
+
+# --- Sensitivity-based shading/blanking (optional) ---
+# Reads modem_sens_utm.nc / modem_sens_utm_{D}km.nc from
+# precompute.py (only produced if USE_SENSITIVITY was True
+# there, and a .sns file was found). Units match SENS_TRANSFORM chosen in
+# that script (default log10(sensitivity)). Applies to both the horizontal
+# depth slices and the vertical sections.
+#
+# Missing sensitivity data (NaN — e.g. outside the .sns file's own
+# coverage) is always treated as fully shaded/blanked: we have no basis for
+# claiming a cell is well-resolved just because we have no information.
+USE_SENSITIVITY = False
+
+# Cells with sensitivity below this are fully blanked (set to NaN,
+# transparent) — poorly-resolved regions disappear entirely, the same way
+# air cells do. Set to None to disable blanking.
+# NOTE: kept ON *in addition to* SENS_ALPHA_RANGE below — belt-and-braces.
+# SENS_ALPHA_RANGE already makes these cells fully transparent by itself,
+# but blanking to NaN also removes them from the colour-scale/data array,
+# which matters if this array is reused elsewhere (e.g. exported).
+SENS_BLANK_THRESHOLD = -6  # log10(1e-4) — sensitivity < 1e-4
+
+# Cells with sensitivity between these two values get a smooth semi-
+# transparent white overlay fading from fully shaded (SENS_SHADE_MAX_ALPHA,
+# at or below the first value) to unshaded (0 alpha, at or above the
+# second) — a softer "how much to trust this" cue than a hard blank cutoff.
+# Set to None to disable shading. Values are in the same units as
+# SENS_TRANSFORM.
+# Switched OFF for now: it was washing everything from -4 to 0 with an
+# opaque-ish white layer, which is a *different* effect from "make the
+# low-sensitivity area transparent" (it actually makes it more opaque, just
+# white instead of coloured) and was likely what made sensitivity masking
+# look like it wasn't doing anything useful. Re-enable if you also want
+# that softer cue on top of the hard cutoff below.
+SENS_SHADE_RANGE = None  # e.g. (-2.0, 0.0)
+SENS_SHADE_COLOR = "white"
+SENS_SHADE_MAX_ALPHA = 0.99
+
+# Cells with sensitivity between these two values fade the *data layer
+# itself* (the resistivity colour, not an overlay on top of it) from fully
+# transparent (at/below the first value) to its normal opacity
+# (1 - ALPHA_RHO, at/above the second). Unlike SENS_SHADE_RANGE — which
+# washes poorly-resolved cells with an extra flat colour on top — this
+# lets whatever is drawn underneath (the topography hillshade basemap, in
+# particular) show straight through in poorly-resolved areas, which reads
+# better than grey/white wash when the point is to relate resistivity
+# structure to topography. Can be used together with SENS_SHADE_RANGE/
+# SENS_BLANK_THRESHOLD, or on its own. Set to None to disable (data alpha
+# stays the constant 1 - ALPHA_RHO everywhere, as before). Values are in
+# the same units as SENS_TRANSFORM (log10 sensitivity by default).
+#
+# NOTE on the upper bound: with SENS_TRANSFORM="LOG10", sensitivity itself
+# is normalised to [0, 1], so log10(sensitivity) never exceeds 0 — the
+# best-resolved cell you can ever have sits at exactly 0. That means the
+# *second* value of this range (where opacity reaches its normal maximum)
+# should essentially always stay 0; only the first value (how lenient the
+# cutoff is) is worth changing.
+#
+# Example (a) — sharp cutoff, no fade: everything below the threshold is
+# fully transparent, everything at/above it is fully opaque, nothing in
+# between. This is what's currently active below.
+SENS_ALPHA_RANGE = (-3.0, -3.0)
+# SENS_ALPHA_RANGE = (-3., -3.)    # more lenient cutoff (sens < 1e-3)
+# SENS_ALPHA_RANGE = (-2., -2.)    # stricter cutoff (sens < 1e-2)
+#
+# Example (b) — soft fade from -2 up to 0: cells fade in gradually as
+# sensitivity improves from 1e-2 to 1 (fully resolved), rather than
+# snapping straight from invisible to fully opaque.
+# SENS_ALPHA_RANGE = (-2., 0.)
+
+# --- Optional standalone sensitivity plots ---
+# In addition to using sensitivity to blank/shade/fade the resistivity
+# plots above, optionally produce separate maps and sections showing the
+# raw sensitivity field itself — same basemap, feature overlays, and
+# exact mesh-cell geometry as the resistivity plots, just a different
+# field and colour scale. Useful for judging where to set
+# SENS_BLANK_THRESHOLD/SENS_ALPHA_RANGE directly, rather than only seeing
+# their effect secondhand on the resistivity plot. Requires
+# USE_SENSITIVITY and a sensitivity file to actually be available; has no
+# effect otherwise.
+PLOT_SENSITIVITY_MAPS = True
+
+CMAP_SENS = "jet_r"
+# Same units as SENS_TRANSFORM (log10 sensitivity by default). CMAX_SENS
+# is left at 0 since log10(sensitivity) can't exceed that (see the
+# SENS_ALPHA_RANGE note above) — CMIN_SENS is the one worth tuning, and
+# is set wider than SENS_BLANK_THRESHOLD/SENS_ALPHA_RANGE on purpose, so
+# this plot shows the falloff you're deciding a cutoff against, not just
+# a clipped version of it.
+CMIN_SENS = -4.0
+CMAX_SENS = 0.0
+SENS_CBAR_LABEL = "log$_{10}$(sensitivity)"
+
+# Colourmap: matplotlib built-in name ("jet_r", "RdBu", "turbo_r", "bwr_r",
+# etc.), OR a path to a colourmap file to import (.cpt = GMT colour palette
+# table, .txt/.csv = plain RGB(A) list) — useful to match a specific
+# published palette, or the same palette used in plot_seis.py, for
+# direct visual comparison, e.g.:
+#   CMAP_RHO = "../cpt/rho_gmt.cpt"
+CMAP_RHO = "jet_r"
+CMAP_RHO = load_colormap(CMAP_RHO)
+
+# Export the resolved colourmap above (over [CMIN_RHO, CMAX_RHO]) to a GMT
+# .cpt file — reverse of the import above. Useful to get an exact GMT
+# equivalent of whatever colourmap/range is actually used for this run
+# (a matplotlib built-in, or something already imported from a file).
+EXPORT_CPT = False
+EXPORT_CPT_PATH = "modem_rho_cmap.cpt"
+EXPORT_CPT_NSTEPS = 32
+if EXPORT_CPT:
+    export_colormap_to_cpt(
+        CMAP_RHO, CMIN_RHO, CMAX_RHO, EXPORT_CPT_PATH, EXPORT_CPT_NSTEPS
+    )
+
+# Resistivity overlay transparency (0 = opaque, 1 = invisible)
+ALPHA_RHO = 0.45
+
+# --- Isolines (contours) on top of the resistivity images ---
+# Applies to both the depth-slice maps and the vertical sections below.
+# Independent on/off switches so e.g. maps can carry isolines while
+# sections stay clean, or vice versa. Note: unlike this script's exact,
+# non-interpolated pcolormesh fill (each patch = one true mesh cell),
+# contour lines are inherently interpolated between cell centres — there's
+# no way to draw a smooth isoline through blocky, piecewise-constant data
+# without some interpolation; this affects only the isolines, not the
+# underlying colour fill.
+ISO_LINES_MAP    = False   # depth-slice map images
+ISO_LINES_VSLICE = False   # vertical-section images
+
+# Contour levels, in the same units as the plotted data (log10(ρ) [Ω·m]):
+#   "auto"          -> ISO_AUTO_N evenly spaced levels spanning the
+#                      finite data range of each individual panel
+#   [v1, v2, ...]    -> explicit list of log10(ρ) values, used as-is,
+#                      shared by every panel (e.g. [1.0, 2.0, 3.0])
+ISO_LEVELS_MAP    = "auto"
+ISO_LEVELS_VSLICE = "auto"
+ISO_AUTO_N = 6   # number of levels when ISO_LEVELS_* == "auto"
+
+# Line style for the isolines themselves
+ISO_STYLE = dict(colors="black", linewidths=0.6, linestyles="solid", zorder=7)
+
+# Inline value labels along each contour line
+ISO_LABEL          = True
+ISO_LABEL_FMT      = "%.1f"
+ISO_LABEL_FONTSIZE = 6
+
+# Pre-computed UTM-km NetCDF files from precompute.py
+NC_TOPO_MODEM = "modem_topo_utm.nc"  # 2-D elevation, dims (northing, easting)
+NC_SITES = "modem_sites_utm.nc"  # MT site positions
+
+# Optional: reuse bathymetry from the seis pipeline if available
+NC_BATH = f"{SITE_PREFIX}_bath_utm.nc"  # set to "" to skip ocean fill
+
+# Optional: reuse external topo/hillshade from seis pipeline if available.
+# If set, overrides NC_TOPO_MODEM for the greyscale basemap (the ModEM topo
+# is coarser and may show mesh artefacts).
+# Set to "" to use the ModEM topography extracted from the model.
+NC_TOPO_SEIS = f"{SITE_PREFIX}_topo_utm.nc"  # set to "" to use NC_TOPO_MODEM
+
+# Region source:
+#   "model"  — use the extent of the resistivity grid (recommended)
+#   "topo"   — use the extent of the topo grid (wider)
+REGION_SOURCE = "model"
+REGION_MARGIN_KM = 0.0
+
+# Explicit override of the map's displayed x/y range (UTM km), applied
+# *after* REGION_SOURCE/REGION_MARGIN_KM compute the region above — crops
+# (or expands) the displayed view without touching how that region is
+# computed. Also feeds the feature-clipping (_in_region), the map figure's
+# aspect ratio, and the lon/lat tick overlay, so all stay consistent with
+# what's actually drawn. Set to None (default) to use the REGION_SOURCE
+# extent unchanged. Analogous to the per-slice "xlim" in VSLICES below.
+#
+# NOT re-verified for Sabancaya: these bounds (and PROFILE_1_LON/LAT,
+# PROFILE_2_LON/LAT, ARROW_LON/LAT, VOLC_LABEL_IDX further below) are
+# carried over unchanged from the original Tacna-only version of this
+# script — same stale-reference gap as plot_seis.py/plot_dens.py.
+# ModEM's own MODEL_FILE/DATA_FILE (set in precompute.py) already select
+# the right site's inversion result regardless, so this only affects the
+# map's displayed crop/profile lines/arrow position, not which data is
+# plotted — but it means a saba run will currently show Tacna's window
+# unless you override these explicitly. Left as the Tacna values (rather
+# than None/auto) since that's the only verified crop known to work; set
+# your own once a Sabancaya framing has been chosen.
+MAP_XLIM = [310.0, 455.0]  # e.g. [300.0, 420.0]  (easting,  km)
+MAP_YLIM = [7971.6, 8125]  # e.g. [7960.0, 8080.0] (northing, km)
+
+# Hillshade parameters
+HS_AZIMUTH = 315
+HS_ALTITUDE = 45
+HS_SIGMA = 1.0  # Gaussian pre-smooth sigma (pixels); 0 = off
+
+# Draw the topography (hillshade + colour) raster under the map. Set to
+# False for a plain white basemap. Topo coordinates are still loaded
+# regardless (used for REGION_SOURCE="topo" and the ModEM topo used for
+# vertical-section masking), only the expensive hillshade computation and
+# the raster draw itself are skipped.
+SHOW_TOPO_BASEMAP = True
+
+# Topo colour normalisation range (metres)
+TOPO_VMIN = 1000
+TOPO_VMAX = 6000
+
+# Ocean fill colour
+OCEAN_COLOR = "#6baed6"
+
+# =====================================================================
+# COLORBAR SETTINGS
+# SHOW_COLORBAR      : False omits the colorbar entirely — the map panel
+#                      itself is completely unaffected either way.
+# COLORBAR_POSITION  : "right" | "left" | "bottom" | "top"
+# The colorbar is placed in its own explicitly-sized axes, added as EXTRA
+# width (right/left) or height (bottom/top) beyond the map panel — it
+# never steals space from the map, so it can never distort its scale.
+# COLORBAR_SIZE      : bar length, as a fraction (0-1) of the map edge
+#                      it's attached to
+# COLORBAR_ASPECT    : bar length / bar thickness (thickness is derived)
+# =====================================================================
+SHOW_COLORBAR = True
+COLORBAR_POSITION = "right"  # "right" | "left" | "bottom" | "top"
+COLORBAR_SIZE = 0.85  # bar length, fraction of the map edge
+COLORBAR_PAD = 0.10  # inches
+COLORBAR_ASPECT = 20
+COLORBAR_LABEL_SIZE = 12
+COLORBAR_TICK_SIZE = 12
+COLORBAR_NTICKS = 7   # None = matplotlib picks automatically, sized to
+                        # the colorbar's actual length; set an int to force
+                        # a specific tick count instead
+
+# =====================================================================
+# AXIS FONT SETTINGS
+# Font sizes for the plot axes themselves (map Easting/Northing, or
+# section distance/depth axis labels and their tick annotations) and the
+# figure title. Separate from COLORBAR_LABEL_SIZE/COLORBAR_TICK_SIZE,
+# which only affect the colorbar's own label/ticks.
+# =====================================================================
+AXIS_LABEL_SIZE = (
+    12  # pt — "Easting (km)" / "Northing (km)" / "Depth (km)" etc.
+)
+AXIS_TICK_SIZE = 12  # pt — tick annotations on both axes
+AXIS_TITLE_SIZE = 12  # pt — the "log10ρ at ..." / "... — profile_CD" title
+
+# =====================================================================
+# MAP AXES UNITS
+# Selects what the map's bottom/left tick labels show — one or the other,
+# not both (the tick *positions* are simply relabelled in place; no extra
+# axes are added).
+# AXES_UNITS : "km"     — UTM easting/northing in km (default).
+#              "latlon" — longitude/latitude in degrees.
+# LATLON_NTICKS   : number of tick positions when AXES_UNITS="latlon"
+# LATLON_DECIMALS : decimal places on the lon/lat tick labels
+# AXES_KM_COMMA   : when AXES_UNITS="km", add a thousands comma
+#                   (American style, e.g. "8,000"). False -> plain "8000".
+#                   Has no effect when AXES_UNITS="latlon".
+# =====================================================================
+AXES_UNITS = "km"  # "km" | "latlon"
+LATLON_NTICKS = 5
+LATLON_DECIMALS = 2
+AXES_KM_COMMA = True
+
+# =====================================================================
+# FEATURE OVERLAY SETTINGS
+# =====================================================================
+
+# --- Profile lines (lon/lat endpoint pairs; set to [] to disable) ---
+# PROFILE_CD_LON = [-70.476, -69.499213]
+# PROFILE_CD_LAT = [-18.255, -17.0481]
+# PROFILE_2_LON  = [-69.670, -70.034]
+# PROFILE_2_LAT  = [-17.695, -17.267]
+
+PROFILE_1_LON = [-70.034, -69.670]
+PROFILE_1_LAT = [-17.267, -17.695]
+PROFILE_2_LON = [-69.580, -70.48]
+PROFILE_2_LAT = [-17.135, -18.245]
+
+# --- North-arrow anchor (lon, lat) and shaft length (km) ---
+ARROW_LON = -73.6
+ARROW_LAT = -18.1
+ARROW_LEN_KM = 4.0
+
+# --- Seismicity CSV (space-delimited; columns x=lon, y=lat, z=depth km) ---
+CSV_SEISMCAT = "../features/catalog_welllocated_15_simple5.csv"
+
+# --- Volcanoes CSV ---
+CSV_VOLCANES = "../features/volcanes.csv"
+VOLC_LABEL_IDX = [5, 12, 13]  # row indices to label
+
+# Volcano label text: full name vs. short/abbreviated name.
+# VOLC_NAME_COL : volcano name column (volcanes.csv). Labels are
+# truncated to their first VOLC_LABEL_CHARS characters via
+# VOLC_LABEL_STYLE's mode="firstN" (see tomomt.apply_label_mode) rather
+# than reading a separate already-abbreviated column (e.g. "VOLCAN2").
+VOLC_NAME_COL = "NAME"
+
+# --- Cities CSV (columns x=lon, y=lat, Name) ---
+CSV_CITIES = "../features/cities.csv"
+
+# --- Seismic sites CSV (seismometer stations); no header row, columns
+# are network, station, lat, lon, elev_m ---
+CSV_SEISMIC_SITES = "../features/seismic_sites.csv"
+
+# =====================================================================
+# MAP FEATURE LAYERS — simple on/off switches
+# Each flag controls one overlay layer on the map. SHOW_SEISMICITY and
+# SHOW_MT_SITES also control the matching projection onto vertical
+# sections (VSLICE_EQ_STYLE / VSLICE_MT_STYLE), so turning a feature off
+# applies everywhere it would otherwise appear, not just on the map.
+# =====================================================================
+SHOW_PROFILE_LINES = True  # static profile_CD / profile_2 lines
+SHOW_VSLICE_LINES = True  # VSLICES cross-section lines + endpoint labels
+SHOW_SEISMICITY = True
+SHOW_MT_SITES = True
+SHOW_SEISMIC_SITES = True
+SHOW_VOLCANOES = True  # inactive volcano markers + labels
+SHOW_VOLCANOES_ACTIVE = True  # active volcano markers
+SHOW_CITIES = True
+SHOW_NORTH_ARROW = True
+
+# =====================================================================
+# MARKER & LABEL STYLE SETTINGS
+# =====================================================================
+
+PROFILE_1_STYLE = dict(color="black", lw=0.4, zorder=10)
+PROFILE_2_STYLE = dict(color="gray", lw=0.4, zorder=10)
+
+EQ_MARKER_STYLE = dict(
+    marker="o",
+    s=4.5,
+    facecolors="white",
+    edgecolors="black",
+    linewidths=0.2,
+    zorder=11,
+)
+
+# Inverted-triangle marker for MT sites whose *apex* — not its centroid —
+# lands exactly on the site coordinate, like a map pin pointing down at the
+# true position. A plain marker="v" is centred on the point instead, so the
+# tip would sit visibly below the real location.
+_MT_PIN_VERTS = [(0.0, 0.0), (-1.0, 1.732), (1.0, 1.732), (0.0, 0.0)]
+_MT_PIN_CODES = [
+    MplPath.MOVETO,
+    MplPath.LINETO,
+    MplPath.LINETO,
+    MplPath.CLOSEPOLY,
+]
+MT_PIN_MARKER = MplPath(_MT_PIN_VERTS, _MT_PIN_CODES)
+
+# MT sites — loaded from modem_sites_utm.nc, no CSV needed
+# Original pin-marker style, kept as a commented reference:
+# MT_MARKER_STYLE = dict(
+#     marker=MT_PIN_MARKER, s=16, facecolors="yellow", edgecolors="black",
+#     linewidths=0.5, alpha=0.85, zorder=12,
+# )
+MT_MARKER_STYLE = dict(
+    marker="v",
+    s=10,
+    facecolors="yellow",
+    edgecolors="black",
+    linewidths=0.7,
+    zorder=12,
+)
+
+# Off (mode="none") by default — MT site names are usually too dense to
+# label cleanly at map scale; switch mode to "full"/"firstN"/"lastN" to
+# turn them on. rotation=90 (vertical) keeps close-together station
+# names from overlapping each other horizontally.
+MT_LABEL_STYLE = dict(
+    fontsize=5,
+    color="black",
+    zorder=14,
+    rotation=90,
+    offset_x=0.3,
+    offset_y=0.3,
+    mode="none",
+)
+
+# --- Seismic sites (seismometer stations, seismic_sites.csv) ---
+SEISMIC_SITES_MARKER_STYLE = dict(
+    marker="v",
+    s=10,
+    facecolors="green",
+    edgecolors="black",
+    linewidths=0.7,
+    zorder=12,
+)
+
+VOLC_INACT_MARKER_STYLE = dict(
+    marker="^",
+    s=10,
+    facecolors="blue",
+    edgecolors="black",
+    linewidths=0.7,
+    zorder=13,
+)
+# Every *_LABEL_STYLE dict below accepts a "mode" key controlling how
+# much of each feature's name is shown as text (the marker itself is
+# unaffected either way — this only controls the name text):
+#   "full"   - the complete name (default for volcanoes/cities)
+#   "none"   - no text at all, marker only (default for MT sites)
+#   "firstN" - first N characters, e.g. "first3"
+#   "lastN"  - last N characters, e.g. "last3"
+VOLC_LABEL_CHARS = 4   # number of leading characters shown (mode="firstN"
+                        # below) — was previously a separate "VOLCAN2"
+                        # abbreviated-code column; adjust to taste.
+VOLC_LABEL_STYLE = dict(
+    fontsize=6,
+    fontweight="bold",
+    color="black",
+    zorder=14,
+    offset_x=0.3,
+    offset_y=0.3,
+    mode=f"first{VOLC_LABEL_CHARS}",
+)
+
+VOLC_ACT_MARKER_STYLE = dict(
+    marker="^",
+    s=10,
+    facecolors="red",
+    edgecolors="black",
+    linewidths=0.7,
+    zorder=13,
+)
+
+CITY_MARKER_STYLE = dict(
+    marker="s",
+    s=6,
+    facecolors="black",
+    edgecolors="black",
+    linewidths=0.2,
+    zorder=13,
+)
+CITY_LABEL_STYLE = dict(
+    fontsize=6,
+    color="white",
+    zorder=14,
+    offset_x=0.3,
+    offset_y=-0.3,
+    mode="full",
+)
+
+ARROW_STYLE = dict(color="dimgray", lw=2, mutation_scale=14)
+ARROW_LABEL_STYLE = dict(fontsize=9, fontweight="bold", color="dimgray")
+
+# =====================================================================
+# VERTICAL SLICE SETTINGS
+#
+# VSLICES defines a list of arbitrary vertical cross-sections.
+# Each entry is a dict with:
+#
+#   name    : str   — label used in title and output filename
+#   p1      : [x, y] — first  endpoint, in UTM km OR lon/lat (see coord)
+#   p2      : [x, y] — second endpoint, same convention
+#   coord   : "utm"     — p1/p2 are [easting_km, northing_km]
+#             "latlon"  — p1/p2 are [lon_deg, lat_deg]
+#   zmin_km : float — top  of section (km, positive down; 0 = surface)
+#   zmax_km : float — base of section (km, positive down)
+#   swath_km: float — half-width (km) for projecting seismicity onto section
+#   xlim    : optional [xmin, xmax] — crop the *displayed* x-axis range
+#             without recomputing anything. Units must match VSLICE_X_AXIS
+#             below: UTM easting/northing (km) for "utm", or cumulative
+#             distance from p1 (km) for "distance". This only narrows the
+#             plotted view, so it's cheap to iterate on for fine-tuning a
+#             figure. Omit or set to None for the full profile (default).
+#
+# There is no npts/nz sample-resolution setting: sections are cut using
+# the mesh's own exact cell geometry (see compute_vertical_slice_modem),
+# so the resolution along the profile and in depth is whatever the real
+# mesh has at each point — not a user-chosen sampling density.
+#
+# Set VSLICES = [] to skip all vertical sections.
+# =====================================================================
+
+# 
+
+
+VSLICES = [
+    dict(
+        name="profile AA'",
+        p1=[-70.48, -18.245],
+        p2=[-69.580, -17.135],  # lon, lat
+        coord="latlon",
+        # zmin_km must be negative enough to reach above sea level, or real
+        # seismicity there (e.g. within a volcanic edifice) gets silently
+        # excluded by the (zeqs >= zmin_km) filter in
+        # _project_seismicity_to_profile — the catalogue used here has
+        # events down to z = -5.75 km. -8.0 gives some margin.
+        zmin_km=-8.0,
+        zmax_km=30.0,
+        swath_km=10.0,
+    ),
+    # Add further profiles here.
+    dict(
+        name="profile BB'",
+        p1=[-70.034, -17.267],  # lon, lat
+        p2=[-69.670, -17.695],
+        coord="latlon",
+        # zmin_km must be negative enough to reach above sea level, or real
+        # seismicity there (e.g. within a volcanic edifice) gets silently
+        # excluded by the (zeqs >= zmin_km) filter in
+        # _project_seismicity_to_profile — the catalogue used here has
+        # events down to z = -5.75 km. -8.0 gives some margin.
+        zmin_km=-8.0,
+        zmax_km=30.0,
+        swath_km=10.0,
+    ),
+]
+
+# Colour-scale limits for vertical slices (defaults to horizontal map limits)
+VSLICE_CMIN_RHO = CMIN_RHO
+VSLICE_CMAX_RHO = CMAX_RHO
+
+# Vertical exaggeration (1 = true scale)
+VSLICE_VE = 3.0
+
+# Force true equal x/y (km) scale on sections, overriding VSLICE_VE with
+# 1.0 whenever True. Off by default: real profiles are typically much
+# longer than they are deep, so a literal 1:1 scale usually isn't what
+# you want day-to-day — VSLICE_VE stays the normal, always-available
+# control for how exaggerated (or not) a section looks. This flag exists
+# only for the occasional figure where true, undistorted scale actually
+# matters (e.g. comparing directly against a map at the same scale).
+VSLICE_EQUAL_SCALE = False
+
+# VE-label placement on cross-section figures.
+# VSLICE_VE_POS : one of "lower right", "lower left", "upper right",
+#                 "upper left", or an explicit (x, y, ha, va) tuple in
+#                 axes-fraction coordinates.
+# VSLICE_VE_STYLE : remaining ax.text() kwargs (fontsize, color, etc.)
+VSLICE_VE_POS = "lower right"
+VSLICE_VE_STYLE = dict(fontsize=7, color="black")
+
+# --- Free-text annotation (optional) ---
+# Draws one extra line of arbitrary text on every figure this script
+# produces (both depth slices and vertical sections) — e.g. a version tag,
+# a processing note, or a "DRAFT" watermark. Set to None or "" to disable.
+# Default position is top-left so it doesn't collide with the VE label,
+# which sits top-right on sections.
+ANNOTATION_TEXT = None  # e.g. "Preliminary — v3 mesh"
+ANNOTATION_POS = (0.01, 0.99)  # (x, y) in axes-fraction coords
+ANNOTATION_STYLE = dict(fontsize=7, color="gray", ha="left", va="top")
+
+# Horizontal axis for vertical sections:
+#   "utm"      — UTM easting or northing (km)
+#   "distance" — cumulative distance from p1 (km)
+VSLICE_X_AXIS = "distance"
+
+# Seismicity marker style on cross-section
+VSLICE_EQ_STYLE = dict(
+    marker="o",
+    s=4.5,
+    facecolors="white",
+    edgecolors="black",
+    linewidths=0.2,
+    zorder=11,
+)
+
+# MT site marker style on cross-section (projected within swath)
+VSLICE_MT_STYLE = dict(
+    marker=MT_PIN_MARKER,
+    s=16,
+    facecolors="yellow",
+    edgecolors="black",
+    linewidths=0.5,
+    zorder=12,
+)
+
+# Topographic surface line style — this is surf_depth: the model's own
+# exact air/rock boundary (rho >= AIR_LOG10_RHO_THRESHOLD defines air; the
+# surface is the top edge of each column's first non-air cell), NOT the
+# DEM. This is what actually drives the section's data — the fill/no-data
+# gap above it, the seismicity/MT-site depth cutoff, the figure headroom.
+VSLICE_TOPO_STYLE = dict(color="dimgray", lw=0.5, zorder=12)
+
+# Optional, purely visual comparison: the real DEM (modem_topo_utm.nc),
+# plotted as its own line so you can see how well the model's own
+# air/rock boundary (VSLICE_TOPO_STYLE, above) tracks the actual
+# topography. Off by default — it plays no part in defining the surface,
+# the fill, the seismicity/MT-site depth cutoff, or the figure headroom,
+# all of which use surf_depth only, regardless of this setting.
+VSLICE_SHOW_DEM_TOPO_LINE = False
+VSLICE_DEM_TOPO_STYLE = dict(color="black", lw=0.6, ls="--", zorder=13)
+
+# Fill colours for the topography band above the section
+VSLICE_TOPO_LAND_COLOR = "gray"  # z > 0 (above sea level)
+VSLICE_TOPO_OCEAN_COLOR = "#6baed6"  # z <= 0 (below sea level)
+
+# Extra headroom above the highest topographic point (km).
+VSLICE_TOPO_HEADROOM_KM = 1.0
+
+# Minimum number of consecutive non-air cells (going deeper) required
+# before a column's shallowest valid cell is accepted as the real
+# topographic surface. A single spurious cell — a padding/air cell that
+# wasn't actually assigned a true air resistivity, or a column that
+# landed in the wrong mesh cell — can otherwise be mistaken for the
+# surface, producing a tall, sharp, flat-topped artifact standing above
+# the genuine terrain on either side of it. 1 disables this check and
+# reverts to "first valid cell, no matter what".
+VSLICE_SURFACE_MIN_RUN = 1
+
+# Print, for every profile segment, its (i, j) cell, position, detected
+# surf_depth, and the raw air/rock classification and resistivity values
+# near the surface — plain facts, no detection logic. Set False to quiet
+# this (verbose — one line or so per segment).
+VSLICE_PRINT_SURFACE_CELLS = True
+
+# Style of the profile line drawn on the map figures
+VSLICE_MAP_LINE_STYLE = dict(color="magenta", lw=0.8, ls="--", zorder=15)
+
+# =====================================================================
+# END USER SETTINGS
+# =====================================================================
+
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+
+def ncpath(name):
+    """Join a bare precomputed-NetCDF filename onto NC_DIR."""
+    return tomomt.resolve_path(NC_DIR, name)
+
+
+def _edges_to_centers(edges):
+    """Cell-centre coordinates from a 1-D array of cell edges (length N+1
+    -> length N). Used only for contour(), which needs point coordinates
+    matching the data shape — the exact-edge pcolormesh fill elsewhere in
+    this script doesn't need this.
+    """
+    edges = np.asarray(edges)
+    return 0.5 * (edges[:-1] + edges[1:])
+
+
+def resolve_iso_levels(data2d, levels_spec, n_auto=ISO_AUTO_N):
+    """Resolve an ISO_LEVELS_* setting into an explicit list of contour
+    levels for one panel.
+
+    "auto" (or None) picks n_auto evenly spaced levels spanning the finite
+    (non-NaN) data range of this particular panel — panels differ, so this
+    is computed fresh each time rather than once globally. An explicit
+    list/tuple is used verbatim, unchanged, so every panel shares the same
+    levels. Returns [] if there's no usable finite data (e.g. an
+    all-air/all-NaN panel) or an explicit level list was empty.
+    """
+    if levels_spec is None or (isinstance(levels_spec, str) and levels_spec.lower() == "auto"):
+        finite = data2d[np.isfinite(data2d)]
+        if finite.size == 0:
+            return []
+        vmin, vmax = float(finite.min()), float(finite.max())
+        if vmin == vmax:
+            return []
+        return list(np.linspace(vmin, vmax, n_auto + 2)[1:-1])
+    return list(levels_spec)
+
+
+def draw_iso_contours(ax, x, y, data2d, levels_spec, n_auto=ISO_AUTO_N):
+    """Overlay isolines (contours) of data2d on ax, using ISO_STYLE/
+    ISO_LABEL/ISO_LABEL_FMT/ISO_LABEL_FONTSIZE. x, y must be 1-D
+    cell-centre coordinates matching data2d's shape (use
+    _edges_to_centers() first if only cell edges are available). No-op if
+    there are no usable levels (see resolve_iso_levels).
+    """
+    levels = resolve_iso_levels(data2d, levels_spec, n_auto)
+    if not levels:
+        return None
+    cs = ax.contour(x, y, data2d, levels=levels, **ISO_STYLE)
+    if ISO_LABEL:
+        ax.clabel(cs, fmt=ISO_LABEL_FMT, fontsize=ISO_LABEL_FONTSIZE, inline=True)
+    return cs
+
+
+# ------------------------------------------------------------------
+# Coordinate helper / hillshade / sensitivity-alpha helpers — see
+# tomomt.py for implementation
+# ------------------------------------------------------------------
+to_utm_km = tomomt.to_utm_km
+compute_hillshade = tomomt.compute_hillshade
+sens_shade_alpha = tomomt.sens_shade_alpha
+sens_data_alpha = tomomt.sens_data_alpha
+
+
+def draw_sens_shade_overlay(ax, e_edges, n_edges, alpha_2d, zorder):
+    """Draw a solid-colour overlay (SENS_SHADE_COLOR) whose per-cell alpha
+    comes from alpha_2d, to visually de-emphasise poorly-resolved cells.
+    Uses the exact (non-uniform) ModEM cell edges, same as the
+    resistivity raster."""
+    rgb = mcolors.to_rgb(SENS_SHADE_COLOR)
+    shade_cmap = mcolors.ListedColormap([rgb])
+    ax.pcolormesh(
+        e_edges,
+        n_edges,
+        np.zeros_like(alpha_2d),
+        cmap=shade_cmap,
+        vmin=0,
+        vmax=1,
+        shading="flat",
+        alpha=alpha_2d,
+        zorder=zorder,
+    )
+
+
+def load_sens_depth_slice(tag, ref_shape, ref_northing, ref_easting):
+    """
+    Load modem_sens_utm_{tag}.nc for the horizontal-slice loop, re-oriented
+    to match the resistivity slice's own (northing, easting) orientation.
+    Returns None if sensitivity is disabled or the file doesn't exist.
+    """
+    if not USE_SENSITIVITY:
+        return None
+    path = ncpath(f"modem_sens_utm_{tag}.nc")
+    if not os.path.exists(path):
+        print(
+            f"  WARNING: {path} not found — sensitivity masking/shading "
+            f"is disabled for this depth slice. Check that "
+            f"precompute.py found the .sns file (look for its "
+            f"own WARNING) and that OUTPUT_DIR there matches NC_DIR here."
+        )
+        return None
+    _da = xr.open_dataarray(path)
+    sy = _da["northing"].values
+    sx = _da["easting"].values
+    sv = _da.values.copy().astype(float)
+    _da.close()
+
+    if sv.shape[0] != len(sy):
+        sv = sv.T
+    if sy[0] > sy[-1]:
+        sy = sy[::-1]
+        sv = sv[::-1, :]
+    if sx[0] > sx[-1]:
+        sx = sx[::-1]
+        sv = sv[:, ::-1]
+
+    if sv.shape != ref_shape or not (
+        np.allclose(sy, ref_northing) and np.allclose(sx, ref_easting)
+    ):
+        print(
+            f"  WARNING: {path} grid doesn't match the resistivity slice "
+            f"— skipping shading/blanking for this depth."
+        )
+        return None
+    return sv
+
+
+# ------------------------------------------------------------------
+# Save helper
+# ------------------------------------------------------------------
+def save_fig(fig, stem):
+    return tomomt.save_fig(fig, stem + PLOT_FILENAME_SUFFIX, PLOT_DIR,
+                            PLOT_FORMATS, PLOT_DPI)
+
+
+def _maybe_show():
+    """Display the current figure only if SHOW_PLOTS=True *and* matplotlib
+    is actually running an interactive backend -- see tomomt.maybe_show()."""
+    tomomt.maybe_show(SHOW_PLOTS)
+
+
+def draw_annotation(ax):
+    """Draw the optional free-text annotation (ANNOTATION_TEXT), if set."""
+    tomomt.draw_annotation(
+        ax, ANNOTATION_TEXT, ANNOTATION_POS, ANNOTATION_STYLE
+    )
+
+
+def _region():
+    return (xmin, xmax, ymin, ymax)
+
+
+def _colorbar_settings():
+    return dict(
+        show=SHOW_COLORBAR,
+        position=COLORBAR_POSITION,
+        size=COLORBAR_SIZE,
+        pad=COLORBAR_PAD,
+        aspect=COLORBAR_ASPECT,
+        label_size=COLORBAR_LABEL_SIZE,
+        tick_size=COLORBAR_TICK_SIZE,
+        nticks=COLORBAR_NTICKS,
+        title_size=AXIS_TITLE_SIZE,
+    )
+
+
+_resolve_ve_pos = tomomt.resolve_ve_pos
+
+
+def _in_region(xe, yn):
+    """Boolean mask: True where (xe, yn) fall inside the map region."""
+    return tomomt.in_region(xe, yn, _region())
+
+
+def clipped_markers(ax, xe, yn, **kwargs):
+    """plot()-marker restricted to points inside the map region — true
+    linear markersize (points), not scatter's area-based s. See
+    tomomt.clipped_markers for the full docstring."""
+    tomomt.clipped_markers(ax, xe, yn, _region(), **kwargs)
+
+
+# Backward-compatible alias for any old call sites still using the former
+# name; clipped_markers (ax.plot-based, linear markersize) is now primary.
+clipped_scatter = clipped_markers
+
+
+def clipped_labels(ax, xe, yn, labels, style_dict):
+    """Draw text labels for points inside the map region — see
+    tomomt.clipped_labels for the full docstring."""
+    tomomt.clipped_labels(ax, xe, yn, labels, style_dict, _region())
+
+
+def draw_north_arrow(ax, x_km, y_km, length_km=4.0):
+    """Draw a north arrow at UTM position (x_km, y_km) if inside region."""
+    tomomt.draw_north_arrow(
+        ax, x_km, y_km, _region(), ARROW_STYLE, ARROW_LABEL_STYLE, length_km
+    )
+
+
+# ------------------------------------------------------------------
+# Map/section figure creation — guarantees equal x/y (km) scale BY
+# CONSTRUCTION; see tomomt.build_panel_figure for the full docstring.
+# ------------------------------------------------------------------
+def create_map_figure():
+    map_w_in = FIG_WIDTH / 2.54
+    map_h_in = map_w_in * (ymax - ymin) / (xmax - xmin)
+    return tomomt.build_panel_figure(
+        map_w_in, map_h_in, _colorbar_settings(), size_label="map"
+    )
+
+
+def _vslice_colorbar_settings():
+    """
+    Same as _colorbar_settings(), but with a FIXED thickness (inches)
+    computed once from whichever of VSLICE_WIDTH_CM/VSLICE_HEIGHT_CM is
+    the fixed panel dimension for this run (see the fixed-dimension
+    choice in plot_vertical_slice) — never from a profile's own derived
+    (and therefore possibly-varying) dimension. This keeps every vertical
+    section's colorbar the same thickness regardless of the profile's
+    own length, without needing to know every other profile's length in
+    advance.
+    """
+    settings = _colorbar_settings()
+    ref_len_in = (VSLICE_HEIGHT_CM if VSLICE_HEIGHT_CM is not None
+                  else VSLICE_WIDTH_CM) / 2.54
+    settings["thickness_in"] = (COLORBAR_SIZE * ref_len_in) / COLORBAR_ASPECT
+    return settings
+
+
+def create_section_figure(w_in, h_in):
+    return tomomt.build_panel_figure(
+        w_in, h_in, _vslice_colorbar_settings(), size_label="section"
+    )
+
+
+def finish_panel_colorbar(cax, mappable, label):
+    """Render the colorbar into the cax returned by create_map_figure()."""
+    return tomomt.finish_panel_colorbar(
+        cax, mappable, label, _colorbar_settings()
+    )
+
+
+def finish_section_colorbar(cax, mappable, label):
+    """Render the colorbar into the cax returned by create_section_figure()."""
+    return tomomt.finish_panel_colorbar(
+        cax, mappable, label, _vslice_colorbar_settings()
+    )
+
+
+# ------------------------------------------------------------------
+# Secondary lon/lat axes  (cosmetic overlay on UTM-km plot)
+# ------------------------------------------------------------------
+def add_latlon_ticks(ax):
+    """Replace UTM-km tick labels with lon/lat values — see
+    tomomt.add_latlon_ticks for the full docstring. Controlled by
+    AXES_UNITS, LATLON_NTICKS, LATLON_DECIMALS."""
+    tomomt.add_latlon_ticks(
+        ax,
+        _region(),
+        LATLON_NTICKS,
+        LATLON_DECIMALS,
+        AXIS_LABEL_SIZE,
+        AXIS_TICK_SIZE,
+    )
+
+
+# ==================================================================
+# Vertical slice engine
+# ==================================================================
+
+_profile_utm_km = tomomt.profile_utm_km
+_profile_labels = tomomt.profile_labels
+
+
+def _grid_line_crossings(p0, p1, edges):
+    """t in (0,1) where the segment p0->p1 crosses each value in `edges`.
+
+    Used to find every point where a profile line crosses a real ModEM
+    grid line (a cell boundary) — the basis of the exact section cut.
+    """
+    d = p1 - p0
+    if d == 0:
+        return np.array([])
+    t = (edges - p0) / d
+    return t[(t > 1e-12) & (t < 1.0 - 1e-12)]
+
+
+def _profile_breakpoints(e1, n1, e2, n2, e_edges, n_edges):
+    """
+    Sorted t in [0,1] at every grid-line crossing along the profile
+    (e1,n1)->(e2,n2), including the endpoints t=0 and t=1. Between any two
+    consecutive values the profile stays within a single (i,j) mesh
+    column, so each such interval corresponds to one real horizontal cell
+    the profile actually passes through.
+    """
+    ts = np.concatenate(
+        [
+            [0.0, 1.0],
+            _grid_line_crossings(e1, e2, e_edges),
+            _grid_line_crossings(n1, n2, n_edges),
+        ]
+    )
+    return np.unique(ts)
+
+
+def _locate_ij(e, n, e_edges, n_edges):
+    """(i, j) mesh indices of the cell containing (e, n), or None if the
+    point falls outside the grid. i = northing index, j = easting index
+    (ModEM convention — see build_utm_axes in the precompute script)."""
+    j = np.searchsorted(e_edges, e, side="right") - 1
+    i = np.searchsorted(n_edges, n, side="right") - 1
+    if j < 0 or j >= len(e_edges) - 1 or i < 0 or i >= len(n_edges) - 1:
+        return None
+    return i, j
+
+
+def _step_lookup(s_query, s_edges, values):
+    """Piecewise-constant lookup: the value of whichever segment (defined
+    by s_edges, length len(values)+1) contains each point in s_query."""
+    idx = np.searchsorted(s_edges, s_query, side="right") - 1
+    idx = np.clip(idx, 0, len(values) - 1)
+    return values[idx]
+
+
+def _s_to_xarr(s, L, e_ends, n_ends, mode):
+    """Convert along-profile distance(s) (km) to the section's horizontal
+    plot coordinate, exactly (the profile is a straight line, so this is
+    linear — no lookup table needed)."""
+    s = np.asarray(s, dtype=float)
+    if mode == "distance" or L == 0:
+        return s
+    t = np.clip(s / L, 0.0, 1.0)
+    if mode == "easting":
+        return e_ends[0] + t * (e_ends[1] - e_ends[0])
+    else:
+        return n_ends[0] + t * (n_ends[1] - n_ends[0])
+
+
+def compute_vertical_slice_modem(vslice):
+    """
+    Cut the ModEM resistivity model (modem_model_utm.nc) along a vertical
+    profile using the mesh's own, exact cell geometry — no interpolation.
+
+    The profile line is intersected with the mesh's real grid lines
+    (modem_grid_edges_utm.nc) to find the exact sequence of (i,j) cell
+    columns it passes through; within each such along-profile segment,
+    every depth cell is drawn with its own real value and its own real
+    depth-edge boundaries (also exact — z edges are the same everywhere
+    in x,y for a ModEM tensor mesh, so no approximation is needed there
+    either). Every colour in the resulting section is therefore an
+    unmodified value from one specific real 3-D cell.
+
+    Returns
+    -------
+    s_edges    : 1-D (nseg+1,) along-profile distance edges (km)
+    d_edges    : 1-D (ndepth+1,) depth-cell edges (km, positive down),
+                 restricted to the profile's zmin_km/zmax_km window
+    section    : 2-D (ndepth, nseg) exact log10(ρ), one real cell per patch
+    e_ends     : 1-D [e0, e1]  UTM km, for map overlay
+    n_ends     : 1-D [n0, n1]  UTM km
+    surf_depth : 1-D (nseg,)  depth (km) of the top edge of the shallowest
+                 valid (non-air) cell in each segment's column — the
+                 model's own surface, exact by construction.
+    topo_prof  : 1-D (nseg,)  surface elevation (m) from modem_topo_utm.nc
+                 at each segment's midpoint, or None — kept only for the
+                 land/ocean colour distinction (a real DEM is a genuinely
+                 continuous field, so interpolating it is appropriate,
+                 unlike the FD mesh's own piecewise-constant cells).
+    sens_section : 2-D (ndepth, nseg) exact sensitivity field, or None if
+                 USE_SENSITIVITY is False or modem_sens_utm.nc is missing.
+    L          : along-profile length (km), for VE/figure-size and for
+                 mapping seismicity/MT-site along-profile distances.
+    air_valid  : 2-D (ndepth, nseg) boolean, True where the cell is real
+                 rock (not air/no-data) — the mask surf_depth was derived
+                 from, before any sensitivity-based blanking. Lets a
+                 caller mask air cells out of a standalone sensitivity
+                 plot without conflating that with sensitivity blanking.
+    """
+    e_ends, n_ends = _profile_utm_km(vslice)
+    e1, e2 = e_ends
+    n1, n2 = n_ends
+    zmin_s = vslice.get("zmin_km", 0.0)
+    zmax_s = vslice.get("zmax_km", 60.0)
+    L = float(np.hypot(e2 - e1, n2 - n1))
+
+    # Load the full 3-D model + its exact grid geometry
+    _da = xr.open_dataarray(ncpath("modem_model_utm.nc"))
+    e_ax = _da["easting"].values  # km
+    n_ax = _da["northing"].values  # km
+    vals = _da.values  # (ndepth, nnorthing, neasting)
+    _da.close()
+
+    # Ensure axes ascending — vals/e_ax/n_ax are reordered together if
+    # needed; grid_e_edges/grid_n_edges/grid_d_edges are always ascending
+    # by construction (cumulative sums of positive cell widths), so once
+    # vals is in ascending order the two describe the same cells.
+    if n_ax[0] > n_ax[-1]:
+        vals = vals[:, ::-1, :]
+        n_ax = n_ax[::-1]
+    if e_ax[0] > e_ax[-1]:
+        vals = vals[:, :, ::-1]
+        e_ax = e_ax[::-1]
+
+    e_edges = grid_e_edges
+    n_edges = grid_n_edges
+    d_edges = grid_d_edges
+    if vals.shape != (len(d_edges) - 1, len(n_edges) - 1, len(e_edges) - 1):
+        sys.exit(
+            f"modem_grid_edges_utm.nc doesn't match modem_model_utm.nc "
+            f"(edges describe {len(d_edges)-1}×{len(n_edges)-1}×"
+            f"{len(e_edges)-1} cells, model has {vals.shape}) — re-run "
+            f"precompute.py."
+        )
+
+    # Matching cell *counts* (checked above) isn't enough to guarantee
+    # modem_grid_edges_utm.nc and modem_model_utm.nc describe the SAME
+    # cells: if the two files were written by precompute runs with
+    # different TRIM_PAD/CROP_TO_REGION/TAR_LON/TAR_LAT settings (e.g.
+    # only one of the two output files got regenerated after a settings
+    # change), they can have identical shapes while actually being
+    # shifted or cropped differently — every _locate_ij() lookup below
+    # would then silently return the wrong (i, j) for some profile
+    # segments, pulling in an unrelated column's data. That's exactly
+    # the shape of a real, if oddly located, block of "wrong" values —
+    # not a smooth artifact, since neighbouring segments (using a
+    # different, still-consistent (i, j)) look fine. Catch it explicitly
+    # here rather than let it silently produce a misleading section.
+    def _centers_bracketed(centers, edges):
+        return bool(np.all((centers >= edges[:-1]) & (centers <= edges[1:])))
+
+    if not (
+        _centers_bracketed(e_ax, e_edges) and _centers_bracketed(n_ax, n_edges)
+    ):
+        sys.exit(
+            "modem_grid_edges_utm.nc and modem_model_utm.nc disagree on "
+            "cell positions (some model cell centres fall outside their "
+            "supposedly matching edge interval), even though their cell "
+            "counts match. This means the two files were built from "
+            "inconsistent precompute settings — most likely TRIM_PAD, "
+            "CROP_TO_REGION, TAR_LON, or TAR_LAT changed between runs and "
+            "only one of the two output files was regenerated. Any "
+            "exact-mesh lookup using them together will silently pick the "
+            "wrong cell for some profile segments — the likely cause of "
+            "isolated, flat-topped topography artifacts. Re-run "
+            "precompute.py fully (in one pass, so both files "
+            "come from the same settings) before plotting."
+        )
+
+    # Restrict the depth range to what's needed (one cell of padding on
+    # each side) for the requested zmin_km/zmax_km window, then clip only
+    # the outermost edge of the two boundary cells to zmin_s/zmax_s
+    # exactly — each boundary cell keeps its real value, just truncated
+    # at the requested window (same "keep the value, clip the display"
+    # approach precompute.py uses for CROP_TO_REGION). This
+    # makes the section's depth range — and so its derived figure height
+    # — match plot_modem_image.py's uniformly-resampled axis
+    # exactly, rather than differing by however much of the boundary
+    # cells' real thickness would otherwise extend past what was asked
+    # for.
+    k_lo = max(np.searchsorted(d_edges, zmin_s, side="right") - 1, 0)
+    k_hi = min(
+        np.searchsorted(d_edges, zmax_s, side="left") + 1, len(d_edges) - 1
+    )
+    d_edges_true = d_edges[k_lo : k_hi + 1]
+    d_edges_c = d_edges_true.copy()
+    vals_c = vals[k_lo:k_hi, :, :]
+    # Only clamp a boundary edge to the requested window if the model's
+    # real data actually extends past it — i.e. we're legitimately
+    # truncating a real cell's displayed extent, the same "keep the
+    # value, clip the display" trick precompute.py uses for
+    # CROP_TO_REGION. If the model's real edge is already within the
+    # window (its own physical grid simply doesn't reach as far as
+    # zmin_km/zmax_km — routine here, since the .rho file only extends
+    # up to the maximum topography and nothing above that exists at all),
+    # do NOT stretch the display edge out to the window boundary: doing
+    # so would inflate that boundary cell's displayed thickness to fill
+    # the entire gap between the model's real edge and the requested
+    # window, painting its colour across a region with no real data
+    # behind it — exactly what produced the tall, flat-topped blocks
+    # seen above the true topography. Leaving the edge at the model's own
+    # boundary instead means pcolormesh simply doesn't draw anything in
+    # that gap, and it renders as plain axes background (white).
+    if d_edges_true[0] < zmin_s:
+        d_edges_c[0] = zmin_s
+    if d_edges_true[-1] > zmax_s:
+        d_edges_c[-1] = zmax_s
+
+    # Exact along-profile breakpoints: every real grid-line crossing
+    ts = _profile_breakpoints(e1, n1, e2, n2, e_edges, n_edges)
+    n_seg = len(ts) - 1
+    s_edges = ts * L
+
+    seg_e_mid = e1 + ((ts[:-1] + ts[1:]) / 2.0) * (e2 - e1)
+    seg_n_mid = n1 + ((ts[:-1] + ts[1:]) / 2.0) * (n2 - n1)
+
+    n_depth = vals_c.shape[0]
+    section = np.full((n_depth, n_seg), np.nan)
+    seg_ij = [None] * n_seg
+    for k in range(n_seg):
+        ij = _locate_ij(seg_e_mid[k], seg_n_mid[k], e_edges, n_edges)
+        seg_ij[k] = ij
+        if ij is not None:
+            i, j = ij
+            section[:, k] = vals_c[:, i, j]
+
+    # Mask air cells (log10(ρ) ≈ 17 for RHO_AIR) so they show as no-data
+    # rather than a saturated colour.
+    section[section >= AIR_LOG10_RHO_THRESHOLD] = np.nan
+
+    # Surface = the TOP EDGE of the shallowest valid (non-air) cell in
+    # each segment's column — exact, since it's a real cell boundary, not
+    # an interpolated sample point. This must use the cells' TRUE edges
+    # (d_edges_true), not the window-clamped d_edges_c: the two boundary
+    # cells' displayed extent is truncated to zmin_km/zmax_km for the
+    # pcolormesh grid and figure sizing above, but if either boundary
+    # cell is itself the shallowest valid (non-air) one for some segment,
+    # reading its clamped edge would flatten that segment's surface to
+    # exactly zmin_km regardless of the cell's real position — a hard,
+    # artificial plateau, not the model's actual (if blocky) topography.
+    # "Shallowest valid cell" itself is also required to start a run of
+    # at least VSLICE_SURFACE_MIN_RUN consecutive valid cells (see
+    # tomomt.first_valid_run) — a single spurious valid cell (e.g. a
+    # padding cell not truly at RHO_AIR, or a column that landed in the
+    # wrong mesh cell) would otherwise read as a real, if oddly placed,
+    # topographic surface, producing a tall flat-topped artifact.
+    valid = ~np.isnan(section)
+    has_data, first_valid_idx = tomomt.first_valid_run(
+        valid, VSLICE_SURFACE_MIN_RUN
+    )
+    surf_depth = np.full(n_seg, d_edges_c[-1])
+    surf_depth[has_data] = d_edges_true[first_valid_idx[has_data]]
+
+    # Sensitivity — same exact per-segment column lookup, sharing seg_ij
+    # so the two fields stay pixel-for-pixel aligned.
+    sens_section = None
+    if USE_SENSITIVITY and not os.path.exists(ncpath("modem_sens_utm.nc")):
+        print(
+            "  WARNING: modem_sens_utm.nc not found — sensitivity "
+            "masking/shading is disabled for this section. Check that "
+            "precompute.py found the .sns file (look for its "
+            "own WARNING) and that OUTPUT_DIR there matches NC_DIR here."
+        )
+    if USE_SENSITIVITY and os.path.exists(ncpath("modem_sens_utm.nc")):
+        _sda = xr.open_dataarray(ncpath("modem_sens_utm.nc"))
+        svals = _sda.values
+        _sda.close()
+        if n_ax[0] > n_ax[-1]:
+            svals = svals[:, ::-1, :]
+        if e_ax[0] > e_ax[-1]:
+            svals = svals[:, :, ::-1]
+        svals_c = svals[k_lo:k_hi, :, :]
+
+        sens_section = np.full((n_depth, n_seg), np.nan)
+        for k, ij in enumerate(seg_ij):
+            if ij is not None:
+                i, j = ij
+                sens_section[:, k] = svals_c[:, i, j]
+        print("  sens min = ", np.nanmin(sens_section))
+
+        if SENS_BLANK_THRESHOLD is not None:
+            _blank_mask = sens_section < SENS_BLANK_THRESHOLD
+            print(
+                f"  sens blanking: {np.sum(_blank_mask)}/{_blank_mask.size} "
+                f"cells below threshold ({SENS_BLANK_THRESHOLD})"
+            )
+            section = np.where(_blank_mask, np.nan, section)
+
+    # Topo along profile — a real DEM, genuinely continuous, so
+    # interpolating it (at each segment's midpoint) is appropriate; kept
+    # only to flag ocean (elevation <= 0) for the bathymetry fill colour,
+    # not to position the surface line (surf_depth, above, is exact).
+    topo_prof = None
+    if modem_topo_z is not None:
+        topo_interp = RegularGridInterpolator(
+            (modem_topo_y, modem_topo_x),
+            modem_topo_z,
+            method="linear",
+            bounds_error=False,
+            fill_value=np.nan,
+        )
+        topo_prof = topo_interp(np.column_stack([seg_n_mid, seg_e_mid]))
+
+    # Plain per-segment dump, no detection logic: for every segment, its
+    # (i, j) cell, position, detected surf_depth, and the raw resistivity
+    # values (with their air/rock classification) at the cell surf_depth
+    # came from and the few cells below it. Just facts to read directly.
+    if VSLICE_PRINT_SURFACE_CELLS:
+        for k in range(n_seg):
+            ij = seg_ij[k]
+            print(
+                f"  segment {k} (e={seg_e_mid[k]:.2f}, n={seg_n_mid[k]:.2f} km): "
+                f"surf_depth={surf_depth[k]:.2f} km, cell (i,j)={ij}"
+            )
+            if ij is not None:
+                i, j = ij
+                raw = vals_c[:6, i, j]
+                is_air = raw >= AIR_LOG10_RHO_THRESHOLD
+                print(f"    raw log10(rho) near surface: {raw}")
+                print(
+                    f"    is_air (>= {AIR_LOG10_RHO_THRESHOLD}):    {is_air}"
+                )
+
+    return (
+        s_edges,
+        d_edges_c,
+        section,
+        e_ends,
+        n_ends,
+        surf_depth,
+        topo_prof,
+        sens_section,
+        L,
+        valid,
+    )
+
+
+def _project_seismicity_to_profile(e_ends, n_ends, swath_km, zmin_km, zmax_km):
+    """Events within swath_km of the profile and within depth range;
+    returns (along_km, depth_km)."""
+    return tomomt.project_points_to_profile(
+        eq_e0,
+        eq_n0,
+        e_ends,
+        n_ends,
+        swath_km,
+        z0=zeqs,
+        zmin_km=zmin_km,
+        zmax_km=zmax_km,
+    )
+
+
+def _project_mt_sites_to_profile(e_ends, n_ends, swath_km):
+    """MT sites within swath_km; returns along-profile distance (km).
+
+    Depth is not returned here — MT sites sit on the true surface, not at a
+    fixed z=0, so their plotted depth is taken from the section's own
+    surf_depth (interpolated at each site's along-profile position) by the
+    caller instead.
+    """
+    return tomomt.project_points_to_profile(
+        mt_e, mt_n, e_ends, n_ends, swath_km
+    )
+
+
+def plot_vertical_slice(
+    s_edges,
+    d_edges,
+    section,
+    e_ends,
+    n_ends,
+    surf_depth,
+    topo_prof,
+    sens_section,
+    L,
+    lbl_start,
+    lbl_end,
+    vslice,
+    cmap,
+    cmin,
+    cmax,
+    cbar_label,
+    stem,
+    title_field="log$_{10}$ρ",
+):
+    """Produce and save a vertical cross-section figure (UTM km or distance
+    vs depth) as an exact cut through the mesh's real cells — every patch
+    is one true 3-D cell, at its true along-profile and true depth
+    boundaries (see compute_vertical_slice_modem).
+    """
+    swath = vslice.get("swath_km", 10.0)
+    zmin_s = vslice.get("zmin_km", d_edges[0])
+    zmax_s = vslice.get("zmax_km", d_edges[-1])
+    ve = 1.0 if VSLICE_EQUAL_SCALE else VSLICE_VE
+    name = vslice.get("name", "profile")
+
+    # Choose horizontal coordinate mode and convert the exact along-profile
+    # edges to it (an exact linear map — the profile is a straight line).
+    if VSLICE_X_AXIS == "distance":
+        x_mode, x_label = "distance", "Distance along profile (km)"
+    else:
+        de, dn = abs(e_ends[1] - e_ends[0]), abs(n_ends[1] - n_ends[0])
+        if de >= dn:
+            x_mode, x_label = "easting", "Easting (km)"
+        else:
+            x_mode, x_label = "northing", "Northing (km)"
+    x_edges = _s_to_xarr(s_edges, L, e_ends, n_ends, x_mode)
+
+    # x_edges must be ascending for pcolormesh/stairs regardless of profile
+    # direction (northing/easting can decrease along the profile); reorder
+    # section/surf_depth/sens_section together so everything stays aligned.
+    if x_edges[0] > x_edges[-1]:
+        x_edges = x_edges[::-1]
+        section = section[:, ::-1]
+        surf_depth = surf_depth[::-1]
+        if sens_section is not None:
+            sens_section = sens_section[:, ::-1]
+        if topo_prof is not None:
+            topo_prof = topo_prof[::-1]
+
+    eq_dist, eq_dep = _project_seismicity_to_profile(
+        e_ends, n_ends, swath, zmin_s, zmax_s
+    )
+    mt_dist = _project_mt_sites_to_profile(e_ends, n_ends, swath)
+
+    # eq_dist/mt_dist are along-profile distances (km) in the same s units
+    # as s_edges — look up each one's segment directly (piecewise-constant,
+    # exact) rather than interpolating, then convert to the plot's x mode.
+    mt_dep = (
+        _step_lookup(mt_dist, s_edges, surf_depth) if len(mt_dist) else mt_dist
+    )
+    eq_x = _s_to_xarr(eq_dist, L, e_ends, n_ends, x_mode)
+    mt_x = _s_to_xarr(mt_dist, L, e_ends, n_ends, x_mode)
+
+    # An event can only be real if it's at or below the local surface.
+    # Events above it here are a projection artefact (the swath can be wide
+    # enough that an event's true, off-profile position has different local
+    # relief than the profile line itself) rather than physically "in the
+    # air" — but drawing them above the surface line is misleading either
+    # way, so they're dropped from this particular figure.
+    if len(eq_x):
+        local_surf_at_eq = _step_lookup(eq_dist, s_edges, surf_depth)
+        keep = eq_dep >= local_surf_at_eq
+        eq_x, eq_dep = eq_x[keep], eq_dep[keep]
+
+    # Compute the actual y-axis span (including any topo headroom) BEFORE
+    # sizing the figure, so the figure's physical aspect ratio matches
+    # what will actually be drawn. Previously h_in was sized from the
+    # requested zmin_km/zmax_km window alone, ignoring that the axis can
+    # extend further up (surf_depth.min() - headroom) when topography is
+    # involved — the axis then ended up taller than the box was sized
+    # for, silently reducing the effective VE and, since how much taller
+    # depends on how the surface height was determined, making the
+    # apparent amount of "white space" above the topo line differ from
+    # plot_modem_image.py's uniformly-resampled surface.
+    #
+    # Uses the originally REQUESTED zmin_s here, not d_edges[0]: since
+    # d_edges[0] no longer gets stretched out to zmin_s when the model's
+    # real data doesn't reach that far (see compute_vertical_slice_modem),
+    # it would otherwise silently shrink the requested headroom margin
+    # down to whatever the model's real top edge happens to be.
+    y_top = min(zmin_s, surf_depth.min() - VSLICE_TOPO_HEADROOM_KM)
+
+    profile_len = L
+    depth_range = d_edges[-1] - y_top
+    # Exactly one of VSLICE_WIDTH_CM / VSLICE_HEIGHT_CM is the fixed
+    # dimension; the other is derived from it via profile_len and VE.
+    # Fix VSLICE_HEIGHT_CM (leave VSLICE_WIDTH_CM alone — it's ignored in
+    # this case) if you want every section in a run to share the same
+    # vertical extent, so they're directly comparable at a glance,
+    # regardless of how long each profile is — width then varies
+    # naturally with each profile's own length. Fix VSLICE_WIDTH_CM
+    # (VSLICE_HEIGHT_CM = None, the default) for the reverse: every panel
+    # the same width, height varying with profile length instead.
+    if VSLICE_HEIGHT_CM is not None:
+        h_in = VSLICE_HEIGHT_CM / 2.54
+        w_in = h_in * profile_len / (depth_range * ve)
+    else:
+        w_in = VSLICE_WIDTH_CM / 2.54
+        h_in = w_in * (depth_range * ve) / profile_len
+    print(f"  Section figure size: {w_in:.2f} × {h_in:.2f} in")
+
+    fig, ax, cax = create_section_figure(w_in, h_in)
+
+    # VE label must sit above the data pcolormesh (zorder=5) and every
+    # other section overlay (topo/profile/markers go up to zorder=20),
+    # so it stays visible regardless of data_alpha.
+    if ve != 1.0:
+        vx, vy, vha, vva = _resolve_ve_pos(VSLICE_VE_POS)
+        ax.text(
+            vx,
+            vy,
+            f"VE = {ve:.1f}×",
+            transform=ax.transAxes,
+            ha=vha,
+            va=vva,
+            zorder=21,
+            **VSLICE_VE_STYLE,
+        )
+
+    norm = mcolors.Normalize(vmin=cmin, vmax=cmax)
+    # Per-cell alpha for the data layer itself. Sections have no basemap
+    # underneath (unlike the depth-slice maps, where ALPHA_RHO lets the
+    # topography hillshade show through) — so default to fully opaque,
+    # and only reduce alpha when SENS_ALPHA_RANGE is actually in use to
+    # fade poorly-resolved cells and let the topo fill/line show through.
+    data_alpha = 1.0
+    if sens_section is not None and SENS_ALPHA_RANGE is not None:
+        data_alpha = sens_data_alpha(
+            sens_section, SENS_ALPHA_RANGE[0], SENS_ALPHA_RANGE[1], 1.0
+        )
+    # Each rendered patch is exactly one real 3-D mesh cell — true
+    # along-profile boundaries (x_edges, from the profile/grid-line
+    # intersection) and true depth boundaries (d_edges). No interpolation,
+    # no smoothing; antialiased=False avoids hairline seams between
+    # adjacent patches in vector (PDF/EPS) output.
+    im = ax.pcolormesh(
+        x_edges,
+        d_edges,
+        section,
+        cmap=cmap,
+        norm=norm,
+        shading="flat",
+        alpha=data_alpha,
+        zorder=5,
+        antialiased=False,
+    )
+
+    if sens_section is not None and SENS_SHADE_RANGE is not None:
+        alpha_2d = sens_shade_alpha(
+            sens_section,
+            SENS_SHADE_RANGE[0],
+            SENS_SHADE_RANGE[1],
+            SENS_SHADE_MAX_ALPHA,
+        )
+        rgb = mcolors.to_rgb(SENS_SHADE_COLOR)
+        shade_cmap = mcolors.ListedColormap([rgb])
+        ax.pcolormesh(
+            x_edges,
+            d_edges,
+            np.zeros_like(alpha_2d),
+            cmap=shade_cmap,
+            vmin=0,
+            vmax=1,
+            shading="flat",
+            alpha=alpha_2d,
+            zorder=6,
+            antialiased=False,
+        )
+
+    if ISO_LINES_VSLICE:
+        _iso_x = _edges_to_centers(x_edges)
+        _iso_d = _edges_to_centers(d_edges)
+        draw_iso_contours(ax, _iso_x, _iso_d, section, ISO_LEVELS_VSLICE)
+
+    # Surface line/fill come from the section's own exact data (surf_depth
+    # — the true top edge of each segment's shallowest real rock cell), so
+    # they're drawn as a proper staircase (ax.stairs), not a smoothed
+    # curve — the model's own resolution is genuinely blocky, and this
+    # shows that honestly rather than implying more precision than the
+    # mesh actually has.
+    if topo_prof is not None:
+        # Ocean fill only (a genuine physical reference — elevation <= 0 —
+        # not a masked/no-data region), positioned using surf_depth so it
+        # never floats apart from the colour data. step="post" matches
+        # surf_depth's piecewise-constant (per-segment) nature.
+        ocean = topo_prof <= 0
+        if ocean.any():
+            ax.fill_between(
+                x_edges[:-1],
+                0.0,
+                surf_depth,
+                where=ocean,
+                step="post",
+                color=VSLICE_TOPO_OCEAN_COLOR,
+                alpha=0.5,
+                zorder=6,
+                interpolate=False,
+            )
+
+    ax.stairs(
+        surf_depth, x_edges, baseline=None, fill=False, **VSLICE_TOPO_STYLE
+    )
+
+    # Optional, purely visual comparison against the real DEM — see
+    # VSLICE_SHOW_DEM_TOPO_LINE above. Plotted as a smooth line at each
+    # segment's midpoint (the DEM is a genuinely continuous field, unlike
+    # the mesh's own piecewise-constant surf_depth), purely so a mismatch
+    # with the dimgray surf_depth staircase above is easy to see by eye —
+    # it has no effect on the fill, seismicity/MT-site depth cutoff, or
+    # figure headroom, all of which use surf_depth only.
+    if VSLICE_SHOW_DEM_TOPO_LINE and topo_prof is not None:
+        x_mid = (x_edges[:-1] + x_edges[1:]) / 2.0
+        dem_depth_km = -topo_prof / 1e3
+        ax.plot(x_mid, dem_depth_km, **VSLICE_DEM_TOPO_STYLE)
+
+    if SHOW_SEISMICITY and len(eq_x):
+        tomomt.markers(ax, eq_x, eq_dep, **VSLICE_EQ_STYLE)
+    if SHOW_MT_SITES and len(mt_x):
+        tomomt.markers(ax, mt_x, mt_dep, **VSLICE_MT_STYLE)
+
+    x0, x1 = x_edges[0], x_edges[-1]
+    xlim = vslice.get("xlim", None)
+    if xlim is not None:
+        ax.set_xlim(xlim[0], xlim[1])
+    else:
+        ax.set_xlim(min(x0, x1), max(x0, x1))
+    ax.set_ylim(y_top, d_edges[-1])
+    ax.invert_yaxis()
+    ax.set_xlabel(x_label, fontsize=AXIS_LABEL_SIZE)
+    ax.set_ylabel("Depth (km)", fontsize=AXIS_LABEL_SIZE)
+    ax.tick_params(labelsize=AXIS_TICK_SIZE)
+
+    # Endpoint labels at the top of the section
+    for xpos, lbl in ((x0, lbl_start), (x1, lbl_end)):
+        ax.text(
+            xpos,
+            y_top,
+            lbl,
+            ha="center",
+            va="bottom",
+            fontsize=AXIS_LABEL_SIZE,
+            fontweight="bold",
+            color="black",
+            clip_on=False,
+            zorder=20,
+        )
+
+    ax.set_title(
+        f"{title_field} — {name}",
+        fontsize=AXIS_TITLE_SIZE,
+    )
+
+    finish_section_colorbar(cax, im, cbar_label)
+    draw_annotation(ax)
+    save_fig(fig, stem)
+    _maybe_show()
+    plt.close(fig)
+
+
+# --- Topography ---
+# Prefer the higher-resolution seis-pipeline topo if available
+_topo_path = (
+    ncpath(NC_TOPO_SEIS)
+    if (NC_TOPO_SEIS and os.path.exists(ncpath(NC_TOPO_SEIS)))
+    else ncpath(NC_TOPO_MODEM)
+)
+print(f"Loading topography from: {_topo_path}")
+_topo_da = xr.open_dataarray(_topo_path)
+
+# Both seis (dims x/y) and modem (dims easting/northing) grids are supported
+if "x" in _topo_da.dims:
+    topo_x = _topo_da["x"].values  # easting km
+    topo_y = _topo_da["y"].values  # northing km
+elif "easting" in _topo_da.dims:
+    topo_x = _topo_da["easting"].values
+    topo_y = _topo_da["northing"].values
+else:
+    raise ValueError(f"Cannot identify spatial dims in {_topo_path}")
+
+topo_z = _topo_da.values  # (ny, nx) or (northing, easting)
+_topo_da.close()
+
+# Ensure orientation is (northing, easting) with northing increasing upward
+if topo_z.shape[0] != len(topo_y):
+    topo_z = topo_z.T
+if topo_y[0] > topo_y[-1]:
+    topo_y = topo_y[::-1]
+    topo_z = topo_z[::-1, :]
+
+dx_km = float(np.median(np.diff(topo_x)))
+dy_km = float(np.median(np.diff(topo_y)))
+
+topo_extent = [topo_x.min(), topo_x.max(), topo_y.min(), topo_y.max()]
+if SHOW_TOPO_BASEMAP:
+    print("Computing hillshade …")
+    topo_hs = compute_hillshade(
+        topo_z, dx_km, dy_km, HS_AZIMUTH, HS_ALTITUDE, HS_SIGMA
+    )
+    topo_norm = mcolors.Normalize(vmin=TOPO_VMIN, vmax=TOPO_VMAX)
+else:
+    print("Topography basemap disabled (SHOW_TOPO_BASEMAP=False) — skipping hillshade.")
+    topo_hs   = None
+    topo_norm = None
+
+# --- ModEM's own topography (for vertical-section masking only) ---
+# The vertical-section surface mask must line up with wherever mval itself
+# switches from air to rock — that boundary is only guaranteed to match
+# modem_topo_utm.nc (extracted directly from the model). NC_TOPO_SEIS above
+# may be a different, unrelated DEM used purely to make the map basemap
+# look nicer; reusing it for the section mask left thin unmasked slivers of
+# real resistivity poking through wherever the two surfaces disagreed.
+_modem_topo_da = xr.open_dataarray(ncpath(NC_TOPO_MODEM))
+if "easting" in _modem_topo_da.dims:
+    modem_topo_x = _modem_topo_da["easting"].values
+    modem_topo_y = _modem_topo_da["northing"].values
+else:
+    modem_topo_x = _modem_topo_da["x"].values
+    modem_topo_y = _modem_topo_da["y"].values
+modem_topo_z = _modem_topo_da.values
+_modem_topo_da.close()
+
+if modem_topo_z.shape[0] != len(modem_topo_y):
+    modem_topo_z = modem_topo_z.T
+if modem_topo_y[0] > modem_topo_y[-1]:
+    modem_topo_y = modem_topo_y[::-1]
+    modem_topo_z = modem_topo_z[::-1, :]
+CMAP_TOPO = plt.get_cmap("gray")
+
+# --- Bathymetry (optional) ---
+_use_bath = bool(NC_BATH and os.path.exists(ncpath(NC_BATH)))
+if _use_bath:
+    print(f"Loading bathymetry from: {ncpath(NC_BATH)}")
+    _bath_da = xr.open_dataarray(ncpath(NC_BATH))
+    bath_x = (
+        _bath_da["x"].values
+        if "x" in _bath_da.dims
+        else _bath_da["easting"].values
+    )
+    bath_y = (
+        _bath_da["y"].values
+        if "y" in _bath_da.dims
+        else _bath_da["northing"].values
+    )
+    bath_z = _bath_da.values
+    _bath_da.close()
+    if bath_z.shape[0] != len(bath_y):
+        bath_z = bath_z.T
+    bath_extent = [bath_x.min(), bath_x.max(), bath_y.min(), bath_y.max()]
+else:
+    print("Bathymetry file not found — ocean fill skipped.")
+
+# --- MT site positions from NetCDF ---
+print(f"Loading MT sites from: {ncpath(NC_SITES)}")
+_sites_ds = xr.open_dataset(ncpath(NC_SITES))
+mt_e = _sites_ds["easting"].values
+mt_n = _sites_ds["northing"].values
+mt_names = _sites_ds["name"].values.tolist()
+_sites_ds.close()
+
+# ==================================================================
+# Map region
+# ==================================================================
+# Derive region from first depth-slice grid
+_tag0 = (
+    f"{DEPTH_SLICES_KM[0]:.0f}km"
+    if DEPTH_SLICES_KM[0] == int(DEPTH_SLICES_KM[0])
+    else f"{DEPTH_SLICES_KM[0]:.1f}km"
+)
+_nc0 = ncpath(f"modem_rho_utm_{_tag0}.nc")
+_da0 = xr.open_dataarray(_nc0)
+_e0 = _da0["easting"].values
+_n0 = _da0["northing"].values
+_da0.close()
+
+if REGION_SOURCE == "model":
+    utm_region = [
+        float(_e0.min()) - REGION_MARGIN_KM,
+        float(_e0.max()) + REGION_MARGIN_KM,
+        float(_n0.min()) - REGION_MARGIN_KM,
+        float(_n0.max()) + REGION_MARGIN_KM,
+    ]
+    print("Region source: resistivity grid")
+else:
+    utm_region = [topo_x.min(), topo_x.max(), topo_y.min(), topo_y.max()]
+    print("Region source: topo grid")
+
+xmin, xmax, ymin, ymax = utm_region
+
+if MAP_XLIM is not None:
+    xmin, xmax = MAP_XLIM
+if MAP_YLIM is not None:
+    ymin, ymax = MAP_YLIM
+if MAP_XLIM is not None or MAP_YLIM is not None:
+    print(
+        f"UTM region overridden by MAP_XLIM/MAP_YLIM: "
+        f"[{xmin}, {xmax}, {ymin}, {ymax}]"
+    )
+else:
+    print(f"UTM region (km): {utm_region}")
+
+# ==================================================================
+# Feature layers (CSV-based)
+# ==================================================================
+volcanes = pd.read_csv(CSV_VOLCANES)
+utmv_e, utmv_n = to_utm_km(
+    volcanes["LONG"][VOLC_LABEL_IDX].values,
+    volcanes["LAT"][VOLC_LABEL_IDX].values,
+)
+if VOLC_NAME_COL not in volcanes.columns:
+    print(
+        f"  WARNING: volcano name column {VOLC_NAME_COL!r} not found in "
+        f"{CSV_VOLCANES} — labels will be blank."
+    )
+    namev = [""] * len(VOLC_LABEL_IDX)
+else:
+    namev = volcanes[VOLC_NAME_COL][VOLC_LABEL_IDX].values
+
+volc_act_e, volc_act_n = [], []
+for i in range(len(volcanes)):
+    if "ACT" in str(volcanes["ESTADO"][i]):
+        ae, an = to_utm_km([volcanes["LONG"][i]], [volcanes["LAT"][i]])
+        volc_act_e.append(ae[0])
+        volc_act_n.append(an[0])
+
+eqs = pd.read_csv(CSV_SEISMCAT, delimiter=" ")
+eq_e0, eq_n0 = to_utm_km(eqs["x"].values, eqs["y"].values)
+zeqs = eqs["z"].values
+
+cities = pd.read_csv(CSV_CITIES)
+cit_e, cit_n = to_utm_km(cities["x"].values, cities["y"].values)
+name_cit = cities["Name"].values
+
+seis_sites = pd.read_csv(
+    CSV_SEISMIC_SITES,
+    header=None,
+    names=["network", "station", "lat", "lon", "elev_m"],
+)
+seis_site_e, seis_site_n = to_utm_km(
+    seis_sites["lon"].values, seis_sites["lat"].values
+)
+seis_site_names = seis_sites["station"].values
+
+prof_cd_e, prof_cd_n = (
+    to_utm_km(PROFILE_1_LON, PROFILE_1_LAT) if PROFILE_1_LON else ([], [])
+)
+prof2_e, prof2_n = (
+    to_utm_km(PROFILE_2_LON, PROFILE_2_LAT) if PROFILE_2_LON else ([], [])
+)
+arr_e, arr_n = to_utm_km([ARROW_LON], [ARROW_LAT])
+
+
+# ==================================================================
+# Basemap and feature drawing
+# ==================================================================
+def draw_basemap(ax):
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_aspect("equal", adjustable="box")
+    if SHOW_TOPO_BASEMAP:
+        ax.imshow(
+            CMAP_TOPO(topo_norm(topo_z)),
+            origin="lower",
+            extent=topo_extent,
+            aspect="auto",
+            interpolation="bilinear",
+            zorder=1,
+        )
+        ax.imshow(
+            topo_hs,
+            cmap="gray",
+            origin="lower",
+            extent=topo_extent,
+            alpha=0.45,
+            aspect="auto",
+            interpolation="bilinear",
+            zorder=2,
+        )
+    if _use_bath:
+        bath_mask = np.where(bath_z <= 0, 1.0, np.nan)
+        ax.imshow(
+            bath_mask,
+            origin="lower",
+            extent=bath_extent,
+            cmap=mcolors.ListedColormap([OCEAN_COLOR]),
+            vmin=0,
+            vmax=1,
+            alpha=0.85,
+            aspect="auto",
+            interpolation="none",
+            zorder=3,
+        )
+    ax.set_xlabel("Easting (km)", fontsize=AXIS_LABEL_SIZE)
+    ax.set_ylabel("Northing (km)", fontsize=AXIS_LABEL_SIZE)
+    if AXES_UNITS == "km" and AXES_KM_COMMA:
+        _comma_fmt = mpl.ticker.StrMethodFormatter("{x:,.0f}")
+        ax.xaxis.set_major_formatter(_comma_fmt)
+        ax.yaxis.set_major_formatter(_comma_fmt)
+    ax.tick_params(labelsize=AXIS_TICK_SIZE)
+
+
+def draw_features(ax, eq_e, eq_n):
+    if SHOW_PROFILE_LINES:
+        if len(prof_cd_e):
+            ax.plot(prof_cd_e, prof_cd_n, clip_on=True, **PROFILE_1_STYLE)
+        if len(prof2_e):
+            ax.plot(prof2_e, prof2_n, clip_on=True, **PROFILE_2_STYLE)
+
+    # Vertical slice profile lines drawn on the map
+    if SHOW_VSLICE_LINES:
+        for vi, vs in enumerate(VSLICES):
+            ve_ends, vn_ends = _profile_utm_km(vs)
+            lbl_start, lbl_end = _profile_labels(vi)
+            ax.plot(
+                ve_ends,
+                vn_ends,
+                clip_on=True,
+                label=vs.get("name", "slice"),
+                **VSLICE_MAP_LINE_STYLE,
+            )
+            for xy, lbl in zip(zip(ve_ends, vn_ends), (lbl_start, lbl_end)):
+                if _in_region(np.array([xy[0]]), np.array([xy[1]]))[0]:
+                    ax.text(
+                        xy[0],
+                        xy[1],
+                        lbl,
+                        fontsize=AXIS_TICK_SIZE,
+                        fontweight="bold",
+                        color=VSLICE_MAP_LINE_STYLE["color"],
+                        ha="center",
+                        va="bottom",
+                        clip_on=True,
+                        zorder=16,
+                    )
+
+    if SHOW_SEISMICITY:
+        clipped_markers(ax, eq_e, eq_n, label="Seismicity", **EQ_MARKER_STYLE)
+
+    # MT sites from NetCDF (already in UTM km)
+    if SHOW_MT_SITES:
+        clipped_markers(ax, mt_e, mt_n, label="MT site", **MT_MARKER_STYLE)
+        clipped_labels(ax, mt_e, mt_n, mt_names, MT_LABEL_STYLE)
+
+    # Seismic sites (seismometer stations)
+    if SHOW_SEISMIC_SITES:
+        clipped_markers(
+            ax,
+            seis_site_e,
+            seis_site_n,
+            label="Seismic site",
+            **SEISMIC_SITES_MARKER_STYLE,
+        )
+
+    if SHOW_VOLCANOES:
+        clipped_markers(ax, utmv_e, utmv_n, **VOLC_INACT_MARKER_STYLE)
+        clipped_labels(ax, utmv_e, utmv_n, namev, VOLC_LABEL_STYLE)
+
+    if SHOW_VOLCANOES_ACTIVE and volc_act_e:
+        clipped_markers(
+            ax,
+            volc_act_e,
+            volc_act_n,
+            label="Active volcano",
+            **VOLC_ACT_MARKER_STYLE,
+        )
+
+    if SHOW_CITIES:
+        clipped_markers(ax, cit_e, cit_n, label="City", **CITY_MARKER_STYLE)
+        clipped_labels(ax, cit_e, cit_n, name_cit, CITY_LABEL_STYLE)
+
+    if SHOW_NORTH_ARROW:
+        draw_north_arrow(ax, arr_e[0], arr_n[0], length_km=ARROW_LEN_KM)
+
+
+# ==================================================================
+# Main loop
+# ==================================================================
+import matplotlib.ticker  # noqa: E402 — needed for add_colorbar above
+
+# True (non-uniform) ModEM cell-edge coordinates, written by
+# precompute.py. Every raster in this script — depth slices
+# and vertical sections — is rendered as an exact cut through these real
+# mesh cells (pcolormesh + shading="flat"), never resampled onto a
+# uniform pixel grid or interpolated across cell boundaries, so this file
+# is required rather than optional.
+if not os.path.exists(ncpath("modem_grid_edges_utm.nc")):
+    sys.exit(
+        f"{ncpath('modem_grid_edges_utm.nc')} not found. This script "
+        "requires the exact cell-edge geometry written by "
+        "precompute.py — re-run it (with the current version, "
+        "and matching OUTPUT_DIR/NC_DIR) before plotting."
+    )
+_edges_da = xr.open_dataset(ncpath("modem_grid_edges_utm.nc"))
+grid_e_edges = _edges_da["easting_edges"].values
+grid_n_edges = _edges_da["northing_edges"].values
+grid_d_edges = _edges_da["depth_edges"].values
+_edges_da.close()
+print("Loaded exact mesh cell-edge geometry from modem_grid_edges_utm.nc")
+
+out_list = []
+
+for ii, d_km in enumerate(DEPTH_SLICES_KM):
+    tag = f"{d_km:.0f}km" if d_km == int(d_km) else f"{d_km:.1f}km"
+    nc = ncpath(f"modem_rho_utm_{tag}.nc")
+    label = f"{d_km:.0f} km" if d_km == int(d_km) else f"{d_km:.1f} km"
+
+    print(f"Plotting log10(ρ) at {label} …")
+    _da = xr.open_dataarray(nc)
+    vx = _da["easting"].values
+    vy = _da["northing"].values
+    vz = _da.values.copy().astype(float)
+    _da.close()
+
+    # Ensure (northing, easting) orientation with northing increasing upward
+    if vz.shape[0] != len(vy):
+        vz = vz.T
+    if vy[0] > vy[-1]:
+        vy = vy[::-1]
+        vz = vz[::-1, :]
+
+    # Mask true air/no-data cells only (see AIR_LOG10_RHO_THRESHOLD),
+    # independent of the display colour range. Previously this clipped to
+    # [CMIN_RHO, CMAX_RHO] and then NaN'd anything at either boundary —
+    # which also hid genuinely resistive volcanic rock (fresh, unaltered
+    # edifice material routinely exceeds CMAX_RHO) as if it were air.
+    # imshow + Normalize already clamp in-range display to the colour
+    # extremes for anything outside [CMIN_RHO, CMAX_RHO], so no manual
+    # clip is needed here.
+    air_mask = vz >= AIR_LOG10_RHO_THRESHOLD
+    vz[air_mask] = np.nan
+
+    # Sensitivity-based blanking/shading (see USE_SENSITIVITY etc.)
+    sens_vz = load_sens_depth_slice(tag, vz.shape, vy, vx)
+    if sens_vz is not None:
+        if SENS_BLANK_THRESHOLD is not None:
+            _blank_mask = sens_vz < SENS_BLANK_THRESHOLD
+            print(
+                f"  sens blanking: {np.sum(_blank_mask)}/{_blank_mask.size} "
+                f"cells below threshold ({SENS_BLANK_THRESHOLD})"
+            )
+            vz = np.where(_blank_mask, np.nan, vz)
+
+    # Seismicity depth filter
+    zmin = ZMIN_SEISM[ii] if ZMIN_SEISM[ii] is not None else -np.inf
+    zmax = ZMAX_SEISM[ii] if ZMAX_SEISM[ii] is not None else np.inf
+    mask_eqs = (zeqs > zmin) & (zeqs < zmax)
+    eq_e = eq_e0[mask_eqs]
+    eq_n = eq_n0[mask_eqs]
+
+    fig, ax, cax = create_map_figure()
+    draw_basemap(ax)
+
+    norm = mcolors.Normalize(vmin=CMIN_RHO, vmax=CMAX_RHO)
+    # Per-cell alpha for the data layer itself: constant (1-ALPHA_RHO) as
+    # before, unless SENS_ALPHA_RANGE is set — then it fades toward fully
+    # transparent in poorly-resolved cells, letting the topography
+    # basemap underneath show through instead of being covered by data.
+    data_alpha = 1.0 - ALPHA_RHO
+    if sens_vz is not None and SENS_ALPHA_RANGE is not None:
+        data_alpha = sens_data_alpha(
+            sens_vz, SENS_ALPHA_RANGE[0], SENS_ALPHA_RANGE[1], 1.0 - ALPHA_RHO
+        )
+    if grid_e_edges.size != vx.size + 1 or grid_n_edges.size != vy.size + 1:
+        sys.exit(
+            f"modem_grid_edges_utm.nc size ({grid_e_edges.size-1}×"
+            f"{grid_n_edges.size-1} cells) doesn't match this slice "
+            f"({vx.size}×{vy.size} cells) — re-run "
+            f"precompute.py so the edges file matches the "
+            f"current model/crop settings."
+        )
+    # Each rendered patch is exactly one real ModEM cell, at its true
+    # (non-uniform) position and size — see the module docstring.
+    im = ax.pcolormesh(
+        grid_e_edges,
+        grid_n_edges,
+        vz,
+        cmap=CMAP_RHO,
+        norm=norm,
+        alpha=data_alpha,
+        shading="flat",
+        zorder=5,
+    )
+    if sens_vz is not None and SENS_SHADE_RANGE is not None:
+        alpha_2d = sens_shade_alpha(
+            sens_vz,
+            SENS_SHADE_RANGE[0],
+            SENS_SHADE_RANGE[1],
+            SENS_SHADE_MAX_ALPHA,
+        )
+        draw_sens_shade_overlay(
+            ax, grid_e_edges, grid_n_edges, alpha_2d, zorder=6
+        )
+    if ISO_LINES_MAP:
+        draw_iso_contours(ax, vx, vy, vz, ISO_LEVELS_MAP)
+    draw_features(ax, eq_e, eq_n)
+    ax.set_title(f"log$_{{10}}$ρ at {label}", fontsize=AXIS_TITLE_SIZE)
+    finish_panel_colorbar(cax, im, "log$_{10}$(ρ / Ω·m)")
+    if AXES_UNITS == "latlon":
+        add_latlon_ticks(ax)
+    draw_annotation(ax)
+
+    stem = f"modem_rho_{tag}_{SITE_PREFIX}"
+    save_fig(fig, stem)
+    _maybe_show()
+    plt.close(fig)
+    out_list.append(stem)
+
+    # --- Optional standalone sensitivity map (same settings as above,
+    # different field/colour scale — see PLOT_SENSITIVITY_MAPS) ---
+    if PLOT_SENSITIVITY_MAPS and sens_vz is not None:
+        print(f"Plotting sensitivity at {label} …")
+        sens_vz_masked = np.where(air_mask, np.nan, sens_vz)
+
+        fig_s, ax_s, cax_s = create_map_figure()
+        draw_basemap(ax_s)
+        norm_s = mcolors.Normalize(vmin=CMIN_SENS, vmax=CMAX_SENS)
+        im_s = ax_s.pcolormesh(
+            grid_e_edges,
+            grid_n_edges,
+            sens_vz_masked,
+            cmap=CMAP_SENS,
+            norm=norm_s,
+            alpha=1.0 - ALPHA_RHO,
+            shading="flat",
+            zorder=5,
+        )
+        draw_features(ax_s, eq_e, eq_n)
+        ax_s.set_title(f"Sensitivity at {label}", fontsize=AXIS_TITLE_SIZE)
+        finish_panel_colorbar(cax_s, im_s, SENS_CBAR_LABEL)
+        if AXES_UNITS == "latlon":
+            add_latlon_ticks(ax_s)
+        draw_annotation(ax_s)
+
+        stem_s = f"modem_sens_map_{tag}_{SITE_PREFIX}"
+        save_fig(fig_s, stem_s)
+        _maybe_show()
+        plt.close(fig_s)
+        out_list.append(stem_s)
+
+print("\nDone. Output stems:")
+for s in out_list:
+    print(f"  {s}")
+
+
+# ==================================================================
+# Vertical slices
+# ==================================================================
+if VSLICES:
+    print("\n=== Vertical slices ===")
+    for vi, vslice in enumerate(VSLICES):
+        name = vslice.get("name", "profile")
+        print(f"  Computing section: {name} …")
+        lbl_start, lbl_end = _profile_labels(vi)
+        (
+            s_edges,
+            d_edges,
+            section,
+            e_ends,
+            n_ends,
+            surf_depth,
+            topo_prof,
+            sens_section,
+            L,
+            air_valid,
+        ) = compute_vertical_slice_modem(vslice)
+        stem = f"modem_section_{name}_{SITE_PREFIX}"
+        plot_vertical_slice(
+            s_edges,
+            d_edges,
+            section,
+            e_ends,
+            n_ends,
+            surf_depth,
+            topo_prof,
+            sens_section,
+            L,
+            lbl_start,
+            lbl_end,
+            vslice,
+            CMAP_RHO,
+            VSLICE_CMIN_RHO,
+            VSLICE_CMAX_RHO,
+            "log$_{10}$(ρ / Ω·m)",
+            stem,
+        )
+        out_list.append(stem)
+
+        # --- Optional standalone sensitivity section (same settings as
+        # above, different field/colour scale — see PLOT_SENSITIVITY_MAPS).
+        # sens_section=None on this call disables the sensitivity-based
+        # alpha fade, so the sensitivity field is shown fully opaque —
+        # fading it by itself would be circular.
+        if PLOT_SENSITIVITY_MAPS and sens_section is not None:
+            print(f"  Computing sensitivity section: {name} …")
+            sens_section_masked = np.where(air_valid, sens_section, np.nan)
+            stem_s = f"modem_section_{name}_sens_{SITE_PREFIX}"
+            plot_vertical_slice(
+                s_edges,
+                d_edges,
+                sens_section_masked,
+                e_ends,
+                n_ends,
+                surf_depth,
+                topo_prof,
+                None,
+                L,
+                lbl_start,
+                lbl_end,
+                vslice,
+                CMAP_SENS,
+                CMIN_SENS,
+                CMAX_SENS,
+                SENS_CBAR_LABEL,
+                stem_s,
+                title_field="Sensitivity",
+            )
+            out_list.append(stem_s)
+
+    print("\nVertical slice stems:")
+    for s in out_list:
+        if "section" in s:
+            print(f"  {s}")

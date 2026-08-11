@@ -61,7 +61,7 @@ What this script does
 Dependencies
 ------------
     numpy, xarray, pandas, matplotlib
-plus the local `plotpy.py` helper module (also used by the plot
+plus the local `tomomt.py` helper module (also used by the plot
 scripts). The fuzzy c-means / SOM implementations are self-contained
 (NumPy only, no scikit-fuzzy/MiniSom).
 
@@ -76,7 +76,6 @@ AI-generated code — review before use in production.
 """
 
 import csv
-import os
 from pathlib import Path
 
 import numpy as np
@@ -86,13 +85,13 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-import plotpy
+import tomomt
 
-to_utm_km = plotpy.to_utm_km
-compute_hillshade = plotpy.compute_hillshade
-clipped_markers = plotpy.clipped_markers
-clipped_labels = plotpy.clipped_labels
-draw_north_arrow = plotpy.draw_north_arrow
+to_utm_km = tomomt.to_utm_km
+compute_hillshade = tomomt.compute_hillshade
+clipped_markers = tomomt.clipped_markers
+clipped_labels = tomomt.clipped_labels
+draw_north_arrow = tomomt.draw_north_arrow
 
 # =====================================================================
 # USER SETTINGS
@@ -242,7 +241,7 @@ ZMAX_SEISM = [1, 9, 30]
 VOLC_LABEL_IDX = [5, 12, 13]
 # Volcano name column (volcanes.csv). Labels are truncated to their
 # first VOLC_LABEL_CHARS characters via VOLC_LABEL_STYLE's mode="firstN"
-# (see plotpy.apply_label_mode) rather than reading a separate
+# (see tomomt.apply_label_mode) rather than reading a separate
 # already-abbreviated column (e.g. "VOLCAN2") — one source of truth for
 # the name, with truncation as a display-only concern.
 VOLC_NAME_COL = "NAME"
@@ -306,36 +305,11 @@ Path(PLOT_DIR).mkdir(parents=True, exist_ok=True)
 
 def ncpath(name):
     """Join a bare NetCDF filename onto NC_DIR."""
-    return os.path.join(NC_DIR, name)
+    return tomomt.resolve_path(NC_DIR, name)
 
 
-def safe_to_netcdf(obj, path):
-    """
-    Write a Dataset/DataArray to NetCDF, overwriting any existing file at
-    `path` even if it's read-only (see interpolate.py's own copy of
-    this helper for the full rationale).
-    """
-    p = Path(path)
-    if p.exists():
-        try:
-            p.unlink()
-        except PermissionError:
-            os.chmod(p, 0o644)
-            p.unlink()
-    obj.to_netcdf(path)
-
-
-def safe_open_w(path, **kwargs):
-    """Like open(path, 'w', ...), but first clears a read-only leftover
-    file at `path` (same PermissionError issue as safe_to_netcdf)."""
-    p = Path(path)
-    if p.exists():
-        try:
-            p.unlink()
-        except PermissionError:
-            os.chmod(p, 0o644)
-            p.unlink()
-    return open(path, "w", **kwargs)
+safe_to_netcdf = tomomt.safe_to_netcdf
+safe_open_w = tomomt.safe_open_w
 
 
 # ------------------------------------------------------------------
@@ -773,10 +747,8 @@ def _colorbar_settings():
 
 
 def create_map_figure():
-    map_w_in = FIG_WIDTH / 2.54
-    map_h_in = map_w_in * (ymax - ymin) / (xmax - xmin)
-    return plotpy.build_panel_figure(
-        map_w_in, map_h_in, _colorbar_settings(), size_label="map"
+    return tomomt.build_map_figure(
+        FIG_WIDTH, xmin, xmax, ymin, ymax, _colorbar_settings(), size_label="map"
     )
 
 
@@ -810,17 +782,14 @@ def draw_basemap(ax):
     ax.tick_params(labelsize=AXIS_TICK_SIZE)
     if SHOW_NORTH_ARROW:
         arr_e, arr_n = to_utm_km([ARROW_LON], [ARROW_LAT])
-        plotpy.draw_north_arrow(
+        tomomt.draw_north_arrow(
             ax, arr_e[0], arr_n[0], _region(),
             ARROW_STYLE, ARROW_LABEL_STYLE, ARROW_LEN_KM,
         )
 
 
 def save_fig(fig, stem):
-    for fmt in PLOT_FORMATS:
-        out = os.path.join(PLOT_DIR, stem + fmt)
-        fig.savefig(out, dpi=PLOT_DPI, bbox_inches="tight")
-        print(f"  Saved: {out}")
+    return tomomt.save_fig(fig, stem, PLOT_DIR, PLOT_FORMATS, PLOT_DPI)
 
 
 # ==================================================================
@@ -937,14 +906,14 @@ def _draw_cluster_overlay(ax, cax, label_slice, actual_depth):
         fontsize=AXIS_TITLE_SIZE,
     )
     if SHOW_COLORBAR:
-        cbar = plotpy.finish_panel_colorbar(cax, im, "Class", _colorbar_settings())
+        cbar = tomomt.finish_panel_colorbar(cax, im, "Class", _colorbar_settings())
         cbar.set_ticks(_cbar_ticks)
     if AXES_UNITS == "latlon":
-        plotpy.add_latlon_ticks(
+        tomomt.add_latlon_ticks(
             ax, _region(), LATLON_NTICKS, LATLON_DECIMALS,
             AXIS_LABEL_SIZE, AXIS_TICK_SIZE,
         )
-    plotpy.draw_annotation(ax, ANNOTATION_TEXT, ANNOTATION_POS, ANNOTATION_STYLE)
+    tomomt.draw_annotation(ax, ANNOTATION_TEXT, ANNOTATION_POS, ANNOTATION_STYLE)
 
 
 for i_depth, target_depth in enumerate(PLOT_DEPTHS_KM):

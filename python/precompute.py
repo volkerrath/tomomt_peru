@@ -135,7 +135,6 @@ AI-generated code — review before use in production.
 """
 
 import sys
-import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -144,6 +143,8 @@ import numpy as np
 import xarray as xr
 from pyproj import Transformer
 from scipy.interpolate import RegularGridInterpolator
+
+import tomomt
 
 # modem.py must be on the Python path or in the working directory
 try:
@@ -205,26 +206,10 @@ Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 def outpath(name):
     """Join a bare output filename onto OUTPUT_DIR."""
-    return str(Path(OUTPUT_DIR) / name)
+    return tomomt.resolve_path(OUTPUT_DIR, name)
 
 
-def safe_to_netcdf(obj, path):
-    """
-    Write a Dataset/DataArray to NetCDF, overwriting any existing file at
-    `path` even if it's read-only — e.g. left over from an earlier run
-    (possibly by a different user/process, or with different permissions),
-    which otherwise makes xarray's own to_netcdf() raise PermissionError
-    instead of just overwriting it. Removes the stale file first (fixing
-    its permissions first if needed), then writes normally.
-    """
-    p = Path(path)
-    if p.exists():
-        try:
-            p.unlink()
-        except PermissionError:
-            os.chmod(p, 0o644)
-            p.unlink()
-    obj.to_netcdf(path)
+safe_to_netcdf = tomomt.safe_to_netcdf
 
 
 # =====================================================================

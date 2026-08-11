@@ -68,30 +68,28 @@ restrict cross-plots to a sub-volume, that's a straightforward filter to
 add on top of the flattened arrays built by ``_prepare_pair()``/
 ``_prepare_triple()``.
 
-This script duplicates (rather than imports) ``_resolve_interp_file()``,
-``_derive_interp_tag()``, ``load_joint_grid()``, and ``get_field()`` from
-``structure.py``: matches this project's existing per-script
-self-containment pattern (each plotting script owns its copy of this
-boilerplate; only ``plotpy.py``/``modem.py`` are actually shared modules)
-rather than introducing a new shared-import dependency here.
+``_resolve_interp_file()``, ``_derive_interp_tag()``, ``load_joint_grid()``,
+``get_field()``, ``_title_suffix()``, ``_group_label()``, and
+``_maybe_show()`` are thin per-script wrappers around the shared
+implementations in ``tomomt.py`` (formerly duplicated verbatim here and
+in ``structure.py``; now a single source of truth) -- each wrapper just
+supplies this script's own SITE_PREFIX/INTERP_FILE/SHOW_PLOTS/etc.
+globals, the same pattern ``plot_joint.py`` already used for ``tomomt.py``
+(née ``plotpy.py``)'s plotting primitives. See ``tomomt.py``'s module
+docstring for the full list of what moved there and, deliberately, what
+didn't.
 
 Authors: Svetlana Byrdina (SMB), Volker Rath (DIAS)
 """
 
-import glob
-import os
-import re
-import zipfile
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import xarray as xr
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 -- registers the '3d' projection
 from scipy import stats
+
+import tomomt
 
 # ---------------------------------------------------------------------------
 # Site / interpolated-grid selection
@@ -177,7 +175,6 @@ CMAP_COLORBY = "viridis"  # colormap when color_by is set (pairs and triples)
 
 OUTPUT_DIR = "."
 FIG_DPI = 200
-PARIS_TZ = ZoneInfo("Europe/Paris")
 
 # List of matplotlib-supported output extensions, e.g. ["png"] or
 # ["png", "pdf"]. save_paris() saves once per format and returns a list
@@ -201,89 +198,39 @@ INTERP_TAG = None
 # Interpolation-tag derivation / grid loading (mirrors structure.py)
 # ===========================================================================
 
+# ===========================================================================
+# Thin wrappers around tomomt's shared helpers, each supplying this
+# script's own globals -- same pattern plot_joint.py already uses for
+# plotpy (now tomomt).
+# ===========================================================================
+
 def _derive_interp_tag(interp_file):
-    """
-    Pull the interpolation-method tag out of an INTERP_FILE name of the
-    form '..._interp_<method>.nc' (e.g. 'saba_interp_krig.nc' -> 'krig').
-    Falls back to 'unknown' if the pattern isn't found, rather than
-    raising -- this script should still run against oddly named files.
-    """
-    m = re.search(r"_interp_([A-Za-z0-9]+)\.nc$", str(interp_file))
-    return m.group(1) if m else "unknown"
+    return tomomt.derive_interp_tag(interp_file)
 
 
 def _resolve_interp_file():
-    if INTERP_FILE is not None:
-        return INTERP_FILE
-    candidates = sorted(glob.glob(f"{SITE_PREFIX}_interp_*.nc"))
-    if not candidates:
-        raise FileNotFoundError(
-            f"No {SITE_PREFIX}_interp_*.nc found in the current directory; "
-            f"set INTERP_FILE explicitly."
-        )
-    return candidates[-1]
+    return tomomt.resolve_interp_file(SITE_PREFIX, INTERP_FILE)
 
 
 def _title_suffix():
-    return [SITE_PREFIX, INTERP_TAG]
+    return tomomt.title_suffix(SITE_PREFIX, INTERP_TAG)
 
 
 def _group_label(fields, label):
-    return label if label else "-".join(fields)
+    return tomomt.group_label(fields, label)
 
 
 def _maybe_show(fig):
-    """
-    Show `fig` on screen only if both SHOW_PLOTS is True and matplotlib
-    is actually running with an interactive backend -- an unconditional
-    plt.show() blocks or errors in terminals, batch jobs, and headless
-    cluster (DIAS HPC) environments. Same fix as plot_joint.py/
-    structure.py's SHOW_PLOTS/_maybe_show().
-    """
-    if SHOW_PLOTS and matplotlib.is_interactive():
-        plt.show()
+    tomomt.maybe_show(SHOW_PLOTS)
 
 
-def load_joint_grid(interp_file):
-    """
-    Load INTERP_FILE and confirm it is a genuinely regular UTM-km grid
-    (TARGET_GRID == "joint" in interpolate.py), i.e. 1-D depth/northing/
-    easting coordinate arrays. Cross-plots don't strictly need the
-    coordinate-exact gradients that make structure.py "joint"-only, but
-    this script is kept to the same grid mode for consistency (one grid
-    convention across the pipeline's diagnostic stages) and because
-    "seismic"-mode files carry 2-D aux coords this script isn't written
-    to flatten correctly. Raises with a clear message otherwise.
-    """
-    ds = xr.open_dataset(interp_file)
-
-    grid_mode = ds.attrs.get("target_grid", None)
-    has_1d_coords = all(
-        name in ds.coords and ds.coords[name].ndim == 1
-        for name in ("depth", "northing", "easting")
-    )
-    if grid_mode == "seismic" or not has_1d_coords:
-        raise ValueError(
-            f"{interp_file} is not a regular 'joint' UTM grid "
-            f"(target_grid={grid_mode!r}). crossplots.py only supports "
-            f"TARGET_GRID='joint' -- see module docstring. Re-run "
-            f"interpolate.py with TARGET_GRID='joint' to produce a "
-            f"compatible INTERP_FILE."
-        )
-    return ds
-
-
-def get_field(ds, key):
-    if key not in ds.data_vars:
-        raise KeyError(
-            f"Field '{key}' not found in {ds.encoding.get('source', 'INTERP_FILE')}; "
-            f"available fields: {sorted(ds.data_vars)}"
-        )
-    depth = ds.coords["depth"].values
-    northing = ds.coords["northing"].values
-    easting = ds.coords["easting"].values
-    values = ds[key].transpose("depth", "northing", "easting").values.astype(float)
-    return values, depth, northing, easting
+# load_joint_grid() here is kept to the same "joint"-only grid mode as
+# structure.py for consistency (one grid convention across the
+# pipeline's diagnostic stages), not because cross-plots strictly need
+# the coordinate-exact gradients that make it a requirement there; see
+# tomomt.load_joint_grid()'s docstring.
+load_joint_grid = tomomt.load_joint_grid
+get_field = tomomt.get_field
 
 
 # ===========================================================================
@@ -510,42 +457,16 @@ def plot_triple(ds, field_a, field_b, field_c, color_by, group_label):
 def save_paris(fig, stem, outdir):
     """
     Save `fig` once per format in PLOT_FORMATS, each with its mtime set
-    to now in Europe/Paris local time. Optionally shows the figure first
-    (see SHOW_PLOTS/_maybe_show). Returns a list of the saved paths --
+    to now in Europe/Paris local time. Shows the figure first if
+    SHOW_PLOTS (see _maybe_show). Returns a list of the saved paths --
     call sites use ``saved.extend(save_paris(...))``, not ``.append(...)``.
     """
     _maybe_show(fig)
-    ts = datetime.now(PARIS_TZ).timestamp()
-    paths = []
-    for fmt in PLOT_FORMATS:
-        path = Path(outdir) / f"{stem}.{fmt}"
-        fig.savefig(path, dpi=FIG_DPI)
-        os.utime(path, (ts, ts))
-        paths.append(path)
-    plt.close(fig)
-    return paths
+    return tomomt.save_paris(fig, stem, outdir, PLOT_FORMATS, FIG_DPI)
 
 
 def zip_outputs(paths, project_name="crossplots"):
-    """
-    Bundle the given output files into a single zip named
-    <project_name>_YYYYMMDD_HHMM.zip (Paris time), with each member's
-    internal mtime also set to the Paris-local packaging time -- same
-    convention as the rest of the pipeline's deliverables.
-    """
-    now_paris = datetime.now(PARIS_TZ)
-    zip_name = f"{project_name}_{now_paris.strftime('%Y%m%d_%H%M')}.zip"
-    zip_path = Path(OUTPUT_DIR) / zip_name
-    date_time = now_paris.timetuple()[:6]
-
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in paths:
-            p = Path(p)
-            zi = zipfile.ZipInfo(p.name, date_time=date_time)
-            zi.compress_type = zipfile.ZIP_DEFLATED
-            with open(p, "rb") as f:
-                zf.writestr(zi, f.read())
-    return zip_path
+    return tomomt.zip_outputs(paths, project_name, OUTPUT_DIR)
 
 
 # ===========================================================================

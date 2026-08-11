@@ -33,12 +33,12 @@ precompute.py  →  interpolate.py  →  {SITE_PREFIX}_interp_<method>.nc
                                                         ↓
                                           cluster.py  →  {SITE_PREFIX}_clusters.nc + figures
 
-Two kinds of native source (VARIABLE_SOURCES below)
+Three kinds of native source (VARIABLE_SOURCES below)
 -----------------------------------------------------
-  "modem_points" — a flat point table (precompute.py's
+  "modem_points"  — a flat point table (precompute.py's
     modem_submesh_points.nc, Part A): already (easting_km, northing_km,
     depth_km, value) rows at full native ModEM resolution.
-  "seis_grid"    — a gridded (depth, row, col) cube (precompute.py
+  "seis_grid"     — a gridded (depth, row, col) cube (precompute.py
     Part B's {SITE_PREFIX}_vp.nc / {SITE_PREFIX}_vs.nc / {SITE_PREFIX}_vps.nc / {SITE_PREFIX}_dens.nc),
     with 2-D utm_easting/utm_northing aux coords — flattened, with the
     horizontal coords broadcast across every depth level, into a point
@@ -46,6 +46,22 @@ Two kinds of native source (VARIABLE_SOURCES below)
     that source's own second/third dimension is actually called (lat/
     lon, y/x, ...) — never assumed/hard-coded, always read from the
     file itself.
+  "femtic_points" — a FEMTIC tetrahedral mesh (mesh.dat) + resistivity
+    block (resistivity_block_iterX.dat), read directly via femtic.py
+    (no precompute.py step of its own — FEMTIC's own output files are
+    the native source). Each element's centroid + log10(resistivity)
+    becomes one point, in the same (easting_km, northing_km, depth_km)
+    convention as the other two kinds, via load_femtic_points() below.
+    Air/ocean/explicitly-fixed regions are excluded by default, mirroring
+    femtic.read_model()'s own semantics. Requires an explicit UTM origin
+    (femtic_origin_e_m/femtic_origin_n_m in the VARIABLE_SOURCES entry)
+    — there is no safe default to guess here (see load_femtic_points()'s
+    docstring). Since this is just another native source feeding the
+    same point-cloud → interpolation pipeline as the other two kinds, a
+    ModEM-derived "rho" and a FEMTIC-derived "rho_femtic" can both be
+    declared and interpolated onto the same joint grid in the same run —
+    directly comparable, e.g. as a two-inversion-code cross-check via
+    structure.py's cross-gradient/cosine-similarity diagnostics.
 
 Target grid: TARGET_GRID = "joint" | "seismic"
 ------------------------------------------------
@@ -139,13 +155,14 @@ AI-generated code — review before use in production.
 """
 
 import os
-from pathlib import Path
 
 import numpy as np
 import xarray as xr
 from scipy.interpolate import RBFInterpolator
 from scipy.spatial import Delaunay, cKDTree
 from matplotlib.path import Path as MplPath
+
+import tomomt
 
 # Cap BLAS/OpenMP thread counts used by scipy's linear-algebra-heavy
 # interpolators (RBF/kriging); set before any heavy computation, has no
@@ -174,15 +191,66 @@ NC_DIR = "../precompute/saba/"   # must match OUTPUT_DIR in precompute.py;
                              # {SITE_PREFIX}_interp_<method>.nc is written
                              # here too, alongside its inputs.
 
+# --- FEMTIC mesh/model directory and geo-referencing (only read if a
+# VARIABLE_SOURCES entry below actually uses kind="femtic_points") ---
+# FEMTIC's own output directory — typically not the same as NC_DIR
+# (which is precompute.py's ModEM-centric output), since mesh.dat /
+# resistivity_block_iterX.dat come straight from a FEMTIC run, with no
+# precompute.py step of their own.
+FEMTIC_DIR = "../femtic/"
+
+# UTM METRES of the FEMTIC mesh's own local-coordinate origin (femtic.py's
+# utm_to_model() convention: model-local x/y = UTM easting/northing minus
+# this origin, axes aligned with UTM east/north, no rotation). REQUIRED
+# if any VARIABLE_SOURCES entry uses kind="femtic_points" — there is no
+# safe default to guess here (unlike e.g. GRID_*_KM's auto-bounds, this
+# is essential geo-referencing metadata, not something with a sensible
+# "auto" fallback). Get it from the FEMTIC run's own setup, or from
+# femtic.estimate_utm_origin() against known calibration site positions.
+FEMTIC_ORIGIN_E_M = None
+FEMTIC_ORIGIN_N_M = None
+
+# Depth-axis calibration (km), added to FEMTIC's own z/1000 (z positive
+# downward, metres — femtic.py's documented convention, already matching
+# this pipeline's depth-positive-down convention) — only needed if the
+# FEMTIC mesh's own z=0 datum isn't exactly this project's z=0 reference
+# (precompute.py's build_depth_axis_km() ref_z, for the ModEM side).
+# 0.0 = assume they already match, same safe-default policy as this
+# project's other unverified-until-checked calibration constants.
+FEMTIC_DEPTH_OFFSET_KM = 0.0
+
+# Which regions to exclude before building the point cloud — mirrors
+# femtic.read_model()'s own parameters/semantics exactly (air region 0
+# and any flag==1 region always excluded; region 1 additionally excluded
+# if ocean-present). include_fixed=True keeps every element (air/ocean/
+# fixed included) instead.
+FEMTIC_INCLUDE_FIXED = False
+FEMTIC_OCEAN = None   # None = auto-infer (femtic._infer_ocean_present);
+                       # True/False = force ocean-present/-absent
+
 # --- Variable registry ---
-# Two kinds of source — see module docstring. Every variable becomes a
+# Three kinds of source — see module docstring. Every variable becomes a
 # point cloud (load_variable_points()) before interpolation onto the
-# target grid, so sources on different native grids/resolutions can be
-# combined freely.
+# target grid, so sources on different native grids/resolutions/mesh
+# codes can be combined freely.
 VARIABLE_SOURCES = {
     "rho":  dict(kind="modem_points", file="modem_submesh_points.nc",
                  value_var="resistivity", label="log10 resistivity",
                  units="log10(Ohm.m)"),
+    # FEMTIC alternative/companion to the ModEM "rho" entry above — same
+    # physical quantity, different inversion code's mesh. Give it its
+    # own key (e.g. "rho_femtic", as here) to interpolate BOTH onto the
+    # same joint grid for a direct cross-gradient/cosine-similarity
+    # comparison via structure.py, or reuse the "rho" key itself instead
+    # to swap ModEM for FEMTIC as this project's single resistivity
+    # source. FEMTIC_ORIGIN_E_M/FEMTIC_ORIGIN_N_M above must be set
+    # before uncommenting.
+    # "rho_femtic": dict(kind="femtic_points", mesh_file="mesh.dat",
+    #              block_file="resistivity_block_iter10.dat",
+    #              origin_e_m=FEMTIC_ORIGIN_E_M, origin_n_m=FEMTIC_ORIGIN_N_M,
+    #              depth_offset_km=FEMTIC_DEPTH_OFFSET_KM,
+    #              include_fixed=FEMTIC_INCLUDE_FIXED, ocean=FEMTIC_OCEAN,
+    #              label="log10 resistivity (FEMTIC)", units="log10(Ohm.m)"),
     "cond": dict(kind="modem_points", file="modem_submesh_points.nc",
                  value_var="resistivity", label="conductivity", units=None,
                  derive="conductivity_from_rho"),
@@ -362,25 +430,17 @@ OUTPUT_FILE = None
 
 def ncpath(name):
     """Join a bare NetCDF filename onto NC_DIR."""
-    return os.path.join(NC_DIR, name)
+    return tomomt.resolve_path(NC_DIR, name)
 
 
-def safe_to_netcdf(obj, path):
-    """
-    Write a Dataset/DataArray to NetCDF, overwriting any existing file at
-    `path` even if it's read-only — e.g. left over from an earlier run —
-    which otherwise makes xarray's own to_netcdf() raise PermissionError
-    instead of just overwriting it. Removes the stale file first (fixing
-    its permissions first if needed), then writes normally.
-    """
-    p = Path(path)
-    if p.exists():
-        try:
-            p.unlink()
-        except PermissionError:
-            os.chmod(p, 0o644)
-            p.unlink()
-    obj.to_netcdf(path)
+def fempath(name):
+    """Join a bare filename onto FEMTIC_DIR (mesh.dat /
+    resistivity_block_iterX.dat, only used by kind="femtic_points"
+    VARIABLE_SOURCES entries)."""
+    return tomomt.resolve_path(FEMTIC_DIR, name)
+
+
+safe_to_netcdf = tomomt.safe_to_netcdf
 
 
 # ------------------------------------------------------------------
@@ -473,6 +533,145 @@ def load_seis_grid_points(file, var):
     return points, values, units
 
 
+def _femtic_ocean_present(block_path, block, ocean_override):
+    """
+    Determine ocean-present the same way femtic.read_model() does: an
+    explicit `ocean_override` wins outright; otherwise auto-infer via
+    femtic._infer_ocean_present() on region 1's own raw line. Re-reads
+    just the block file's region-lines section (cheap relative to the
+    element-region mapping section read_resistivity_block() already
+    parsed once) rather than re-implementing the heuristic itself.
+    """
+    if ocean_override is not None:
+        return bool(ocean_override)
+    nreg = int(block["nreg"])
+    if nreg <= 1:
+        return False
+    import femtic  # lazy import — only needed for femtic_points sources
+    nelem = int(block["nelem"])
+    with open(block_path, "r", errors="ignore") as f:
+        f.readline()               # "nelem nreg" header
+        for _ in range(nelem):
+            f.readline()            # element -> region mapping
+        f.readline()                # region 0 (air)
+        region1_line = f.readline()
+    return femtic._infer_ocean_present(region1_line, fmt=block["fmt"])
+
+
+def load_femtic_points(mesh_file, block_file, origin_e_m, origin_n_m,
+                        depth_offset_km=0.0, include_fixed=False, ocean=None):
+    """
+    Load element centroids + log10(resistivity) from a FEMTIC tetrahedral
+    mesh (mesh_file, under FEMTIC_DIR) + resistivity block (block_file),
+    as a point cloud in this pipeline's own (easting_km, northing_km,
+    depth_km) convention.
+
+    FEMTIC's mesh.dat stores node coordinates in MODEL-LOCAL METRES: x/y
+    are UTM easting/northing offset by the mesh's own local origin (axes
+    aligned with UTM east/north, no rotation — femtic.py's own
+    utm_to_model()); z is positive DOWNWARD in metres (femtic.py's
+    documented z-convention, already matching this pipeline's own
+    depth-positive-down convention, so no sign flip is needed here —
+    only the unit conversion to km and, if calibrated, depth_offset_km).
+    origin_e_m/origin_n_m (UTM METRES) are therefore REQUIRED: there is
+    no safe "auto" origin to fall back to. Get them from the FEMTIC run's
+    own setup, or from femtic.estimate_utm_origin() against known
+    calibration site positions.
+
+    include_fixed/ocean mirror femtic.read_model()'s own parameters and
+    semantics exactly (air region 0 and any flag==1 region always
+    excluded; region 1 additionally excluded if ocean-present, auto-
+    inferred unless `ocean` is given explicitly) — applied here per
+    ELEMENT via region_of_elem, since this function needs one point per
+    mesh element, not femtic.read_model()'s one value per region.
+
+    Returns
+    -------
+    points, values, units — same shapes/meaning as load_modem_points():
+    values is log10(resistivity) [Ohm.m] (build_element_arrays() already
+    returns log10), units="log10(Ohm.m)" — the same convention as the
+    "rho" modem_points entry, so a ModEM- and a FEMTIC-derived
+    resistivity are directly comparable once both are interpolated onto
+    the same target grid.
+    """
+    try:
+        import femtic
+    except ImportError as exc:
+        raise ImportError(
+            "load_femtic_points() needs femtic.py -- and, in turn, "
+            "ensembles.py, which femtic.py imports unconditionally at "
+            "module level for its roughness/prior-covariance tools even "
+            "though this function doesn't use them -- importable on "
+            "sys.path. Only required if a VARIABLE_SOURCES entry "
+            "actually uses kind='femtic_points'."
+        ) from exc
+
+    if origin_e_m is None or origin_n_m is None:
+        raise ValueError(
+            "load_femtic_points() requires origin_e_m/origin_n_m (the "
+            "FEMTIC mesh's own local-coordinate origin, in UTM metres) "
+            "-- there's no safe default to guess here. Set "
+            "FEMTIC_ORIGIN_E_M/FEMTIC_ORIGIN_N_M (or this entry's own "
+            "origin_e_m/origin_n_m), from the FEMTIC run's own setup or "
+            "femtic.estimate_utm_origin()."
+        )
+
+    mesh_path = fempath(mesh_file)
+    block_path = fempath(block_file)
+
+    nodes, conn = femtic.read_femtic_mesh(mesh_path)
+    block = femtic.read_resistivity_block(block_path)
+    arrays = femtic.build_element_arrays(
+        nodes=nodes, conn=conn,
+        region_of_elem=block["region_of_elem"],
+        region_rho=block["region_rho"],
+        region_rho_lower=block["region_rho_lower"],
+        region_rho_upper=block["region_rho_upper"],
+        region_n=block["region_n"],
+        region_flag=block["region_flag"],
+    )
+
+    nreg = int(block["nreg"])
+    region_of_elem = block["region_of_elem"]
+    region_flag = block["region_flag"]
+    n_total = len(region_of_elem)
+
+    if include_fixed:
+        elem_valid = np.ones(n_total, dtype=bool)
+        ocean_present = False
+    else:
+        ocean_present = _femtic_ocean_present(block_path, block, ocean)
+        region_fixed = np.zeros(nreg, dtype=bool)
+        region_fixed[0] = True                  # air: always fixed
+        region_fixed |= (region_flag == 1)       # explicitly flagged fixed
+        if nreg > 1 and ocean_present:
+            region_fixed[1] = True               # ocean, if present
+        elem_valid = ~region_fixed[region_of_elem]
+
+    elem_valid &= np.isfinite(arrays["log10_resistivity"])
+
+    centroid = arrays["centroid"][elem_valid]   # model-local metres [x, y, z-down]
+    log10_rho = arrays["log10_resistivity"][elem_valid]
+
+    easting_km = (centroid[:, 0] + origin_e_m) / 1e3
+    northing_km = (centroid[:, 1] + origin_n_m) / 1e3
+    depth_km = centroid[:, 2] / 1e3 + depth_offset_km
+
+    points = np.column_stack([easting_km, northing_km, depth_km]).astype(np.float64)
+    values = log10_rho.astype(np.float64)
+    units = "log10(Ohm.m)"
+
+    excluded = ", ".join(
+        s for s in ("air", "ocean" if ocean_present else None, "other-fixed")
+        if s
+    ) if not include_fixed else "none"
+    print(
+        f"  load_femtic_points: {mesh_file}: {len(points)}/{n_total} elements "
+        f"kept (excluded: {excluded})"
+    )
+    return points, values, units
+
+
 def load_variable_points(key):
     """
     Dispatch to the right native loader for VARIABLE_SOURCES[key], then
@@ -484,6 +683,14 @@ def load_variable_points(key):
         points, values, units = load_modem_points(src["file"], src["value_var"])
     elif src["kind"] == "seis_grid":
         points, values, units = load_seis_grid_points(src["file"], src["var"])
+    elif src["kind"] == "femtic_points":
+        points, values, units = load_femtic_points(
+            src["mesh_file"], src["block_file"],
+            src["origin_e_m"], src["origin_n_m"],
+            depth_offset_km=src.get("depth_offset_km", 0.0),
+            include_fixed=src.get("include_fixed", False),
+            ocean=src.get("ocean", None),
+        )
     else:
         raise ValueError(f"Unknown VARIABLE_SOURCES kind {src['kind']!r} for {key!r}")
 
