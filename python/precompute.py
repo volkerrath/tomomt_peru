@@ -104,8 +104,9 @@ than the area actually of interest. CROP_TO_REGION (shared, see below)
 further crops both parts to the same geographic box TAR_LON/TAR_LAT, so
 the ModEM and seismic outputs cover matching areas.
 
-Helpers used from modem.py (Part A)
---------------------------------------
+Helpers used from tomomt.py (Part A) — consolidated from modem.py so this
+script no longer needs modem.py importable on its own
+--------------------------------------------------------------------------
   read_mod(file, modext, trans)   — reads .rho file → dx, dy, dz, mval, reference
   read_data(Datfile, modext)      — reads .dat file → Site, Comp, Data, Head
   cells3d(dx, dy, dz, center)     — cumulative cell-centre coordinates
@@ -145,14 +146,6 @@ from pyproj import Transformer
 from scipy.interpolate import RegularGridInterpolator
 
 import tomomt
-
-# modem.py must be on the Python path or in the working directory
-try:
-    import modem as mdm
-except ImportError:
-    sys.exit(
-        "Cannot import modem.py — place it in the working directory or on PYTHONPATH."
-    )
 
 # =====================================================================
 # SHARED SETTINGS  (used identically by Part A and Part B)
@@ -226,7 +219,7 @@ DATA_EXT = ".dat"
 
 # --- Sensitivity/resolution file (optional, for shading/blanking) ---
 # Same grid format as the .rho model file — read with the same reader
-# (mdm.read_mod), so it must share the .rho file's mesh (dx/dy/dz, cell
+# (tomomt.read_mod), so it must share the .rho file's mesh (dx/dy/dz, cell
 # counts). Typically shares its base name too, but can be set separately.
 # Set USE_SENSITIVITY = False to skip reading/writing it entirely.
 USE_SENSITIVITY = False
@@ -1304,7 +1297,7 @@ def load_topo_geographic(lon_range, lat_range):
 # 1. Read model
 # ------------------------------------------------------------------
 print("\n=== Reading ModEM model ===")
-dx, dy, dz, mval, reference, trans_in = mdm.read_mod(
+dx, dy, dz, mval, reference, trans_in = tomomt.read_mod(
     file=MODEL_FILE, modext=MODEL_EXT, trans="LINEAR", out=True
 )
 # mval is now in physical Ω·m, shape (nx, ny, nz)
@@ -1338,7 +1331,7 @@ if USE_SENSITIVITY:
             f"shading/blanking (set USE_SENSITIVITY = False to silence)."
         )
     else:
-        sdx, sdy, sdz, sens, sref, strans_in = mdm.read_mod(
+        sdx, sdy, sdz, sens, sref, strans_in = tomomt.read_mod(
             file=SENS_FILE, modext=SENS_EXT, trans="LINEAR", out=True
         )
         if sens.shape != mval.shape:
@@ -1382,7 +1375,7 @@ if USE_SENSITIVITY:
 # Data columns: Period Code GG_Lat GG_Lon X(m) Y(m) Z(m) Component Real Imag Error
 #   col 2 = GG_Lat (°), col 3 = GG_Lon (°)
 #   col 4 = X (m, North), col 5 = Y (m, East), col 6 = Z (m, positive down)
-Site, Comp, Data, Head = mdm.read_data(
+Site, Comp, Data, Head = tomomt.read_data(
     Datfile=DATA_FILE, modext=DATA_EXT, out=True
 )
 
@@ -1543,7 +1536,7 @@ if sens is not None:
 # ------------------------------------------------------------------
 print("\n=== Extracting model topography ===")
 # get_topo expects physical mval (Ω·m) and reference in metres
-xcnt, ycnt, topo_m = mdm.get_topo(
+xcnt, ycnt, topo_m = tomomt.get_topo(
     dx=dx,
     dy=dy,
     dz=dz,

@@ -457,21 +457,6 @@ and the `*_MARKER_STYLE`/`*_LABEL_STYLE` dicts for every overlay
 (seismicity, MT sites, volcanoes, cities, profile lines, north arrow —
 MT sites also get a `VSLICE_MT_STYLE` for cross-section projection).
 
-**On-screen display (`SHOW_PLOTS`):** every figure is always written to
-disk via `save_fig()` regardless of this setting. `SHOW_PLOTS` (default
-`False`) additionally controls whether it's *also* popped up on screen.
-Both scripts used to call `plt.show()` unconditionally after every
-figure, which only behaves reasonably in an environment that keeps a
-live GUI event loop open between calls (Spyder's own console) — the
-same script run from a plain terminal, a batch job, or on the DIAS
-cluster would either block on a display that never advances, or error
-outright with no display at all. `_maybe_show()` now guards every call
-site: it only invokes `plt.show()` when `SHOW_PLOTS=True` **and**
-`matplotlib.is_interactive()` is true, so headless/batch runs work
-unchanged by default, and turning `SHOW_PLOTS` on stays safe even if the
-script happens to run somewhere without a display. Same setting, same
-behaviour, in both scripts.
-
 ---
 
 ## Coordinate convention

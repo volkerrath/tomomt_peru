@@ -31,9 +31,9 @@ its docstring for why the resulting polygon is always well-formed
 tolerance).
 
 Reads the FEMTIC mesh (mesh.dat) and resistivity block
-(resistivity_block_iterX.dat) directly via femtic.py — the same
-element-loading logic (femtic.read_femtic_mesh() /
-femtic.read_resistivity_block() / femtic.build_element_arrays()), the
+(resistivity_block_iterX.dat) directly via tomomt.py — the same
+element-loading logic (tomomt.read_femtic_mesh() /
+tomomt.read_resistivity_block() / tomomt.build_element_arrays()), the
 same UTM-origin coordinate conversion, and the same air/ocean/fixed
 region-exclusion semantics as interpolate.py's load_femtic_points() (see
 that function's docstring and README_interpolate.md's "FEMTIC meshes"
@@ -46,7 +46,7 @@ Shares the same basemap engine (topo hillshade, ocean fill, feature
 overlays, colourbar placement, clipping) as the other plot scripts. The
 main differences from plot_modem_mesh.py:
 
-* Data source: mesh.dat + resistivity_block_iterX.dat via femtic.py,
+* Data source: mesh.dat + resistivity_block_iterX.dat via tomomt.py,
   not precompute.py's modem_*_utm.nc files — this script has no
   precompute step of its own (matching interpolate.py's own
   "femtic_points" source kind).
@@ -55,7 +55,7 @@ main differences from plot_modem_mesh.py:
   or tensor cell-edge grid — there is no such grid to pcolormesh
   against for an unstructured mesh.
 * No sensitivity-based shading/blanking (USE_SENSITIVITY in
-  plot_modem_mesh.py): femtic.py's element-loading functions
+  plot_modem_mesh.py): tomomt.py's element-loading functions
   (build_element_arrays()) don't expose a per-element sensitivity/
   resolution field the way ModEM's .sns file does via precompute.py.
   Flagged here rather than fabricated; if FEMTIC per-element
@@ -86,12 +86,12 @@ main differences from plot_modem_mesh.py:
 Dependencies
 ------------
     numpy, matplotlib, xarray, pandas, pyproj, scipy
-plus the local tomomt.py and femtic.py modules. femtic.py itself
-imports ensembles.py unconditionally at module level (for
-roughness/prior-covariance tools this script doesn't use) —
-ensembles.py must be importable on sys.path for this script to run at
-all, same as pykrige must be installed for interpolate.py's
-INTERP_METHOD="kriging".
+plus the local tomomt.py module (the only local module this script
+needs — its FEMTIC mesh/resistivity-block readers were previously
+provided by femtic.py, which pulled in ensembles.py unconditionally at
+module level for roughness/prior-covariance tools this script never
+used; that dependency is gone now that the read-side subset actually
+used here lives in tomomt.py).
 
 Authors: Svetlana Byrdina (SMB) & Volker Rath (DIAS)
 AI-assisted development: Claude (Anthropic).
@@ -174,7 +174,7 @@ MESH_FILE = "mesh.dat"
 BLOCK_FILE = "resistivity_block_iter10.dat"
 
 # UTM METRES of the FEMTIC mesh's own local-coordinate origin
-# (femtic.py's utm_to_model() convention). REQUIRED — there is no safe
+# (FEMTIC's own utm_to_model() convention). REQUIRED — there is no safe
 # default to guess here; see interpolate.py's identical setting.
 FEMTIC_ORIGIN_E_M = None
 FEMTIC_ORIGIN_N_M = None
@@ -182,7 +182,7 @@ FEMTIC_ORIGIN_N_M = None
 # Depth-axis calibration (km) — see interpolate.py's identical setting.
 FEMTIC_DEPTH_OFFSET_KM = 0.0
 
-# Region exclusion before plotting — mirrors femtic.read_model()'s own
+# Region exclusion before plotting — mirrors tomomt.read_model()'s own
 # semantics exactly, same as interpolate.py's load_femtic_points().
 FEMTIC_INCLUDE_FIXED = False
 FEMTIC_OCEAN = None  # None = auto-infer; True/False = force ocean-present/-absent
@@ -688,7 +688,6 @@ def _femtic_ocean_present(block_path, block, ocean_override):
     nreg = int(block["nreg"])
     if nreg <= 1:
         return False
-    import femtic
     nelem = int(block["nelem"])
     with open(block_path, "r", errors="ignore") as f:
         f.readline()
@@ -696,7 +695,7 @@ def _femtic_ocean_present(block_path, block, ocean_override):
             f.readline()
         f.readline()
         region1_line = f.readline()
-    return femtic._infer_ocean_present(region1_line, fmt=block["fmt"])
+    return tomomt._infer_ocean_present(region1_line, fmt=block["fmt"])
 
 
 def load_femtic_mesh():
@@ -709,15 +708,6 @@ def load_femtic_mesh():
     connectivity to slice — callers pass values with invalid entries set
     to NaN, or filter `conn`/`log10_rho` themselves before slicing).
     """
-    try:
-        import femtic
-    except ImportError as exc:
-        raise ImportError(
-            "load_femtic_mesh() needs femtic.py -- and, in turn, "
-            "ensembles.py, which femtic.py imports unconditionally at "
-            "module level -- importable on sys.path."
-        ) from exc
-
     if FEMTIC_ORIGIN_E_M is None or FEMTIC_ORIGIN_N_M is None:
         raise ValueError(
             "FEMTIC_ORIGIN_E_M/FEMTIC_ORIGIN_N_M are required (the FEMTIC "
@@ -730,9 +720,9 @@ def load_femtic_mesh():
     block_path = fempath(BLOCK_FILE)
 
     print(f"Loading FEMTIC mesh from: {mesh_path}")
-    nodes, conn = femtic.read_femtic_mesh(mesh_path)
-    block = femtic.read_resistivity_block(block_path)
-    arrays = femtic.build_element_arrays(
+    nodes, conn = tomomt.read_femtic_mesh(mesh_path)
+    block = tomomt.read_resistivity_block(block_path)
+    arrays = tomomt.build_element_arrays(
         nodes=nodes, conn=conn,
         region_of_elem=block["region_of_elem"],
         region_rho=block["region_rho"],

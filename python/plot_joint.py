@@ -574,46 +574,17 @@ def _slice_range(data2d, cmin, cmax):
             cmax if cmax is not None else auto_max)
 
 
-def _resolve_iso_spec(spec, key):
-    """ISO_LEVELS_MAP/ISO_LEVELS_VSLICE may be a single "auto"/list
-    (applied to every field) or a dict keyed by field name for per-field
-    control. Fields absent from the dict default to "auto"."""
-    if isinstance(spec, dict):
-        return spec.get(key, "auto")
-    return spec
-
-
-def resolve_iso_levels(data2d, levels_spec, n_auto=ISO_AUTO_N):
-    """Resolve an (already per-field-resolved) ISO_LEVELS_* setting into
-    an explicit list of contour levels for one panel. "auto"/None picks
-    n_auto evenly spaced levels spanning the finite data range of this
-    particular panel. Returns [] if there's no usable finite data."""
-    if levels_spec is None or (isinstance(levels_spec, str) and levels_spec.lower() == "auto"):
-        finite = data2d[np.isfinite(data2d)]
-        if finite.size == 0:
-            return []
-        vmin, vmax = float(finite.min()), float(finite.max())
-        if vmin == vmax:
-            return []
-        return list(np.linspace(vmin, vmax, n_auto + 2)[1:-1])
-    return list(levels_spec)
-
-
 def draw_iso_contours(ax, x, y, data2d, levels_spec, key, n_auto=ISO_AUTO_N):
     """Overlay isolines of data2d on ax, using ISO_STYLE/ISO_LABEL*. key
     is the field name, used to resolve a per-field entry if levels_spec
     is a dict. x/y may be 1-D (regular "joint" grid) or 2-D matching
     data2d's shape (curvilinear "seismic" grid's own utm_easting_km/
     utm_northing_km) — ax.contour() accepts either. No-op if there are
-    no usable levels."""
-    spec = _resolve_iso_spec(levels_spec, key)
-    levels = resolve_iso_levels(data2d, spec, n_auto)
-    if not levels:
-        return None
-    cs = ax.contour(x, y, data2d, levels=levels, **ISO_STYLE)
-    if ISO_LABEL:
-        ax.clabel(cs, fmt=ISO_LABEL_FMT, fontsize=ISO_LABEL_FONTSIZE, inline=True)
-    return cs
+    no usable levels. See tomomt.draw_iso_contours for the implementation."""
+    return tomomt.draw_iso_contours(ax, x, y, data2d, levels_spec, ISO_STYLE,
+                                     n_auto=n_auto, label=ISO_LABEL,
+                                     label_fmt=ISO_LABEL_FMT,
+                                     label_fontsize=ISO_LABEL_FONTSIZE, key=key)
 
 
 # ------------------------------------------------------------------

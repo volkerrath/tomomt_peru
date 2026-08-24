@@ -1,0 +1,778 @@
+# femtic_viz.py
+
+Visualisation utilities for FEMTIC resistivity models, with **direct procedures
+that operate on FEMTIC files** (`mesh.dat` + `resistivity_block_iterX.dat`)
+**without creating an intermediate NPZ**.
+
+---
+
+## Installation / requirements
+
+- `numpy`
+- `matplotlib` (optional; required for Matplotlib plotting helpers)
+- `scipy` (optional; required for KDTree-based scatter curtain, IDW curtain
+  gridding, and `z_top="surface"` borehole auto-detection)
+- `pyvista` (optional; required for VTU/VTK export and PyVista sampling)
+
+---
+
+## Quick start
+
+All functionality is accessed programmatically — `femtic_viz` is a module,
+not a script.  Import it and call the relevant function directly.
+
+### Export a VTK grid for ParaView
+
+```python
+import femtic_viz as fviz
+
+grid = fviz.unstructured_grid_from_femtic("mesh.dat", "resistivity_block_iter0.dat")
+grid.save("model.vtu")
+```
+
+### Matplotlib map slice (centroid-sampled)
+
+```python
+mesh  = fviz.read_femtic_mesh("mesh.dat")
+block = fviz.read_resistivity_block("resistivity_block_iter0.dat")
+rho   = fviz.map_regions_to_element_rho(block.region_of_elem, block.region_rho)
+
+ax = fviz.map_slice_from_cells(mesh, rho, z0=-1000, dz=50,
+                                mode="tri", mask_max_edge=500)
+```
+
+`mode` options: `"tri"` (patch-like, default), `"scatter"` (markers),
+`"grid"` (IDW; requires `scipy`).
+
+### 2-D slice figure
+
+Driven by [`femtic_mod_plot_slice.py`](femtic_mod_plot_slice_readme.md).
+
+```python
+fviz.plot_model_slices(
+    model_file="resistivity_block_iter10.dat",
+    mesh_file="mesh.dat",
+    slices=slices_resolved,          # output of fem.resolve_slice_positions
+    cmap="turbo_r", clim=[0., 4.],
+    display_coords="utm",
+    utm_origin_e=229047., utm_origin_n=8184127.,
+    utm_zone=19, utm_northern=False,
+    plot_file="model_slices.pdf", dpi=300,
+)
+```
+
+### 1-D borehole log
+
+Driven by [`femtic_mod_plot_bh.py`](femtic_mod_plot_bh_readme.md).
+
+```python
+fviz.plot_borehole_logs(
+    model_file="resistivity_block_iter10.dat",
+    mesh_file="mesh.dat",
+    borehole_sites=[
+        dict(name="BH-01",
+             x=(-70.868, "latlon"), y=(-16.363, "latlon"),
+             z_top="surface", z_bot=20000., dz=200.,
+             color="steelblue", ls="-"),
+    ],
+    utm_zone=19, utm_northern=False,
+    utm_origin_e=229047., utm_origin_n=8184127.,
+    clim=[1., 1e4],
+    plot_file="boreholes.pdf", dpi=300,
+)
+```
+
+### 3-D PyVista render + VTK export
+
+Driven by [`femtic_mod_plot_3d.py`](femtic_mod_plot_3d_readme.md).
+
+```python
+fviz.plot_model_3d(
+    mesh_file="mesh.dat",
+    block_file="resistivity_block_iter10.dat",
+    slice_x=[0.], slice_y=[0.], slice_z=[5000., 15000.],
+    isovalues=[1., 2., 3.],
+    plot_file="model_3d.png",
+    vtu_file="model.vtu",            # ParaView / Zenodo export
+)
+```
+
+---
+
+## PyVista sampling on explicit surfaces
+
+If you prefer "true" sampling (no IDW), use:
+
+- `build_curtain_surface(polyline_xy, zmin, zmax, nz, ns)`
+- `build_map_surface(x, y, z0)`
+- `sample_grid_on_surface(unstructured_grid, surface, scalar="log10_resistivity")`
+
+Example:
+
+```python
+import numpy as np
+import femtic_viz as fviz
+
+grid = fviz.unstructured_grid_from_femtic("mesh.dat", "resistivity_block_iter0.dat")
+poly = np.loadtxt("profile.csv", delimiter=",")
+
+surf    = fviz.build_curtain_surface(poly, zmin=0, zmax=-5000, nz=201, ns=501)
+sampled = fviz.sample_grid_on_surface(grid, surf, scalar="log10_resistivity")
+
+# sampled.point_data now contains the sampled scalar and "s", "z".
+```
+
+---
+
+## RTO ensemble diagnostic plots
+
+Two high-level helpers produce joint plots of original vs. perturbed
+data / models for a fixed list of ensemble members.  Both follow the
+**`data_viz` philosophy**: an optional `ax` (or `axs`) can be passed in;
+if `None`, the function creates its own figure.  `(fig, axs)` is always
+returned so the caller can further annotate or save.
+
+These functions are called from `femtic_rto_prep.py` but can also be used
+independently in notebooks or post-processing scripts.
+
+---
+
+### `plot_data_ensemble`
+
+```python
+fig, axs = plot_data_ensemble(
+    orig_file,                   # path to template observe.dat
+    ens_files,                   # list of perturbed observe.dat paths (one per member)
+    sample_indices,              # list of int — which members to plot
+    what="rho",                  # str or list: 'rho', 'phase', 'tipper', 'pt'
+                                 # e.g. ['rho', 'phase'] → two-column layout
+    comps="xy,yx",               # str (shared) or list of same length as what
+    show_errors=False,
+    show_errors_orig=None,       # override for original curves (None → show_errors)
+    show_errors_pert=None,       # override for perturbed curves
+    error_style_orig="shade",    # 'shade' | 'bar' | 'both' for original curves
+    error_style_pert="shade",    # 'shade' | 'bar' | 'both' for perturbed curves
+    n_sites=None,                # MT sites drawn per row; None = all sites
+    alpha_orig=1.0,
+    alpha_pert=0.6,
+    comp_markers=None,           # dict of marker per class; None = DEFAULT_COMP_MARKERS
+    markersize=4.0,
+    markevery=None,
+    figsize=None,                # auto: (5 × n_panels, 3 × n_samples)
+    fig=None,
+    axs=None,                    # pre-existing axes, shape (n_samples, n_panels)
+    out=True,
+)
+# Returns: fig, axs  — axs.shape = (n_samples, n_panels)
+```
+
+**Layout:** rows = number of selected samples; columns = number of entries in
+*what*.  Each cell shows the original (solid) and perturbed (dashed) curves for
+the randomly drawn site subset, overlaid on the same axes.
+
+Typical multi-panel usage:
+
+```python
+fig, axs = fviz.plot_data_ensemble(
+    orig_file, ens_files, VIZ_SAMPLES,
+    what=["rho", "phase", "tipper"],
+    comps="xy,yx",          # shared for rho and phase; ignored for tipper
+)
+# axs.shape == (len(VIZ_SAMPLES), 3)
+```
+
+For per-column component control:
+
+```python
+fig, axs = fviz.plot_data_ensemble(
+    orig_file, ens_files, VIZ_SAMPLES,
+    what=["rho", "phase"],
+    comps=["xy,yx", "xx,xy,yx,yy"],
+)
+```
+
+`show_errors` is a shared shorthand (default `False`).  Use `show_errors_orig`
+and `show_errors_pert` for independent control — the template `observe.dat`
+typically carries raw measured uncertainties that can be very large at long
+periods (dead-band noise), while the perturbed files contain reset relative
+errors.  The recommended setting for RTO diagnostics is therefore
+`show_errors_orig=False, show_errors_pert=True`.
+
+**Error rendering style** is set independently per curve with `error_style_orig`
+and `error_style_pert` (both default to `'shade'`):
+
+| Value | Rendering |
+|---|---|
+| `'shade'` | Semi-transparent `fill_between` band (default) |
+| `'bar'` | Discrete `errorbar` caps at each period |
+| `'both'` | Shade *and* bar simultaneously |
+
+**Component markers** assign distinct marker symbols to three component classes:
+
+| Class | Components | Default marker |
+|---|---|---|
+| `'ii'` | `xx`, `yy` (diagonal) | `'o'` (circles) |
+| `'ij'` | `xy`, `yx` (off-diagonal) | `'s'` (squares) |
+| `'inv'` | invariants, tipper, PT | `'^'` (triangles up) |
+
+Pass `comp_markers=None` to use defaults; `comp_markers={}` to disable markers.
+
+Data files are read via `_observe_to_site_list()` → `femtic.observe_to_site_viz_list()`.
+FEMTIC's `observe.dat` stores impedance in **SI Ω**; because `data_viz`
+assumes **mV/km/nT** (MT field units), Z is scaled by `1/(μ₀ × 10³)` before
+plotting.
+
+---
+
+### `plot_model_ensemble`
+
+```python
+fig, axs = plot_model_ensemble(
+    orig_mod_file,       # path to template resistivity block
+    ens_mod_files,       # list of perturbed block paths (one per member)
+    mesh_file,           # path to shared mesh.dat
+    sample_indices,      # list of int — which members to plot
+    slices,              # list of slice dicts (see below)
+    mode="tri",          # 'tri' | 'scatter' | 'grid'
+    log10=True,
+    cmap="jet_r",
+    clim=None,           # (vmin, vmax) in log10(Ohm.m); auto if None
+    xlim=None,
+    ylim=None,
+    zlim=None,
+    mesh_lines=False,
+    mesh_lw=0.3,
+    mesh_color="k",
+    figsize=None,
+    fig=None,
+    axs=None,
+    out=True,
+)
+```
+
+**Layout:** rows = 2 × number of selected samples (original + perturbed per
+block); columns = number of slices.
+
+Each entry in `slices` is a dict with `'type': 'map'` or `'type': 'curtain'`
+and kwargs forwarded to `map_slice_from_cells` / `curtain_from_cells`:
+
+```python
+slices = [
+    {"type": "map",     "z0": -500,  "dz": 50},
+    {"type": "map",     "z0": -2000, "dz": 50},
+    {"type": "curtain",
+     "polyline": np.array([[0., 0.], [10000., 0.]]),
+     "width": 500},
+]
+```
+
+---
+
+## Air / ocean conventions
+
+Many FEMTIC workflows treat:
+
+- region 0 as **air**
+- region 1 as **ocean**
+
+By default, `unstructured_grid_from_femtic()` and CLI plotting apply:
+
+- air → `NaN` (transparent/blank in most plots)
+- ocean → `0.3` Ohm·m (typical seawater resistivity)
+
+In Matplotlib plots ocean cells are additionally rendered in a flat
+**light-grey** colour so they remain visually distinct from the resistivity
+colour scale regardless of the chosen colormap and colour limits.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `ocean_value` | `3.0e-1` | Resistivity (Ohm·m) used to tag ocean cells |
+| `ocean_color` | `'lightgrey'` | Flat Matplotlib colour for ocean cells; `None` = use colormap |
+
+To suppress the flat-colour treatment entirely, pass `ocean_color=None`.
+
+---
+
+## 2-D slice figure (`plot_model_slices`)
+
+Produces a multi-panel Matplotlib figure of axis-parallel model slices using
+**exact tetrahedron-plane intersection** — no selection slab, no `dw` parameter.
+Every tetrahedron straddling the cutting plane contributes an exact triangle or
+quadrilateral polygon.  Called from `femtic_mod_plot_slice.py`.
+
+```python
+fviz.plot_model_slices(
+    model_file = "resistivity_block_iter10.dat",
+    mesh_file  = "mesh.dat",
+    slices     = slices_resolved,   # pre-resolved by fem.resolve_slice_positions
+
+    cmap  = "turbo_r",
+    clim  = [0., 4.],               # log10(Ω·m); None = auto
+
+    xlim  = [-20000., 20000.],
+    ylim  = [-20000., 20000.],
+    zlim  = [     0.,  20000.],
+
+    display_coords   = "utm",
+    utm_origin_e     = 229047.0,
+    utm_origin_n     = 8184127.0,
+    utm_zone         = 19,
+    utm_northern     = False,
+    utm_to_latlon_fn = utl.utm_to_latlon_zn,
+    latlon_to_model_fn = fem.latlon_to_model,
+
+    site_xys          = site_xys,
+    sites_in_maps     = True,
+    sites_in_slices   = True,
+    site_marker       = dict(marker="v", color="black", ms=4, zorder=10),
+    site_marker_slices= dict(marker="o", color="black", ms=4, zorder=10),
+    projection_dist   = 3000.,
+
+    map_markers = [
+        dict(latlon=[-16.35, -70.90], marker="*", color="red",
+             ms=10, name="Summit"),
+    ],
+
+    depth_km     = True,
+    horiz_km     = True,
+    equal_aspect = True,
+    nrows        = 2,
+    ncols        = 2,
+    panel_height = 8.0 / 2.54,   # inches (divide cm by 2.54)
+
+    plot_file = "model_slices.pdf",
+    dpi       = 300,
+)
+```
+
+### Parameters summary
+
+| Parameter | Default | Description |
+|---|---|---|
+| `model_file`, `mesh_file` | — | Resistivity block and `mesh.dat` |
+| `slices` | — | Pre-resolved slice-spec list (output of `fem.resolve_slice_positions`) |
+| `cmap` | `"turbo_r"` | Matplotlib colormap |
+| `clim` | `None` | `[vmin, vmax]` log₁₀(Ω·m); `None` = auto |
+| `xlim`, `ylim`, `zlim` | `None` | Global axis limits (model-local m) |
+| `ocean_color` | `"lightgrey"` | Flat colour for ocean polygons; `None` = colormap |
+| `ocean_value` | `0.25` | Ω·m sentinel for ocean cells |
+| `air_color` | `"whitesmoke"` | Flat colour for air polygons; `None` = blank gaps |
+| `air_bgcolor` | `None` | Axes facecolor for air region |
+| `site_xys` | `None` | `[(label, x_m, y_m, elev_m), …]` in model-local m |
+| `obs_coords_only` | `False` | Sites from `observe.dat` only (suppresses UTM/latlon display) |
+| `projection_dist` | `None` | Max distance [m] from curtain for site to appear |
+| `sites_in_maps` | `True` | Site markers on map panels |
+| `sites_in_slices` | `False` | Site markers on curtain/plane panels |
+| `site_marker` | `dict(marker="v", …)` | Matplotlib kwargs for map markers |
+| `site_marker_slices` | `dict(marker="o", …)` | Matplotlib kwargs for curtain markers |
+| `map_markers` | `None` | Extra markers (lat/lon dicts) on map panels |
+| `display_coords` | `"model"` | `"model"` / `"utm"` / `"latlon"` |
+| `utm_origin_e`, `utm_origin_n` | `0.0` | Mesh-centre UTM [m] |
+| `utm_zone`, `utm_northern` | `1`, `True` | UTM zone and hemisphere |
+| `utm_to_latlon_fn` | `None` | Callable for lat/lon tick formatting |
+| `latlon_to_model_fn` | `None` | Callable for `map_markers` placement |
+| `plot_file` | `None` | Save path; `None` = `plt.show()` |
+| `dpi` | `200` | Saved-figure DPI |
+| `show` | `False` | If `True`, also call `plt.show()` after saving (when `plot_file` is given) — displays the figure inline in addition to writing it to disk. Useful in interactive environments (Spyder, Jupyter). No effect when `plot_file=None` (already shown either way). |
+| `equal_aspect` | `True` | Equal aspect on map/ns/ew panels |
+| `depth_km` | `False` | Depth axis in km on curtain/plane panels |
+| `horiz_km` | `False` | Horizontal axis in km in `"model"` mode |
+| `nrows`, `ncols` | `None` | Grid shape; surplus cells hidden |
+| `panel_height` | `5.0` | Row height **in inches** |
+| `panel_width` | `None` | Column width in inches; `None` = auto from aspect |
+| `figsize` | `None` | `[width, height]` in inches; overrides auto sizing |
+| `alpha_file` | `None` | Second block file with log10 weights for per-element fading/blanking |
+| `alpha_mode` | `"fade"` | `"fade"` = proportional; `"blank"` = hard cutoff |
+| `alpha_blank_thresh` | `0.0` | log10 threshold for blanking |
+| `tick_fontsize` | `7` | Font size for axis tick labels and colourbar ticks |
+| `label_fontsize` | `8` | Font size for axis labels, panel titles, colourbar label |
+| `tick_decimals` | `None` | Decimal digits on depth / easting-northing (model or UTM) / lat-lon tick labels, all sharing one value. `None` = prior per-axis-type formatting unchanged (`:g` for depth, Matplotlib auto for easting/northing, `.3f` for lat/lon) |
+| `borehole_sites` | `None` | List of borehole spec dicts — appended as extra columns to the right |
+| `borehole_style` | `None` | Baseline line kwargs for borehole traces |
+| `borehole_clim` | `None` | `[rho_min, rho_max]` in Ω·m for borehole x-axis; `None` = auto |
+| `borehole_shared` | `True` | `True` = one extra column; `False` = one column per borehole |
+| `borehole_resolve_xy` | `None` | `(spec) → (x_m, y_m)` CRS converter for borehole positions |
+
+Per-panel `invert_x` key in each slice dict (applies to `ns`, `ew`, `plane`
+kinds only): when `True`, calls `ax.invert_xaxis()` after rendering so the
+horizontal axis reads right-to-left.  Default `False`; no effect on `map` panels.
+
+### Embedded borehole columns
+
+When `borehole_sites` is provided, borehole panels are appended as extra
+columns inside the **same figure** using a `GridSpec` layout with narrower
+column widths (0.7× the slice panel height).  The borehole depth y-axis is
+linked to the leftmost curtain/plane panel for synchronised zoom/pan.
+
+```python
+fviz.plot_model_slices(
+    ...,   # normal slice args
+    borehole_sites = [
+        dict(name="BH-01", x=0., y=0.,
+             lat=-16.363, lon=-70.868,
+             z_top="surface", z_bot=20000., dz=200.,
+             color="steelblue"),
+    ],
+    borehole_clim   = [1., 1e4],   # Ω·m
+    borehole_shared = True,
+)
+```
+
+---
+
+## 1-D borehole log (`plot_borehole_logs`)
+
+Samples the resistivity model along vertical boreholes using point-in-element
+search (`fem.extract_borehole_log`, exact barycentric test) and plots
+ρ vs depth on a **logarithmic x-axis** (Ohm·m).  Called from
+`femtic_mod_plot_bh.py`.
+
+```python
+fviz.plot_borehole_logs(
+    model_file = "resistivity_block_iter10.dat",
+    mesh_file  = "mesh.dat",
+    borehole_sites = [
+        # model-local metres — explicit lat/lon for legend
+        dict(name="BH-centre", x=0.0, y=0.0,
+             lat=-16.363, lon=-70.868,
+             z_top="surface", z_bot=20000., dz=200.,
+             color="steelblue", ls="-"),
+        # geographic coordinates — lat/lon auto-shown in legend
+        dict(name="BH-south",
+             x=(-70.90, "latlon"), y=(-16.40, "latlon"),
+             z_top="surface", z_bot=15000., dz=100.,
+             color="firebrick", ls="--"),
+        # UTM coordinates — lat/lon back-converted for legend
+        dict(name="BH-north",
+             x=(229047., "utm"), y=(8190000., "utm"),
+             z_top=0., z_bot=15000., dz=100.,
+             color="seagreen", ls="-."),
+    ],
+    utm_zone      = 19,
+    utm_northern  = False,
+    utm_origin_e  = 300472.5,
+    utm_origin_n  = 8189946.1,
+    ocean_value   = 0.25,
+    clim          = [1., 1e4],   # Ohm·m (log scale)
+    shared        = True,
+    plot_file     = "boreholes.pdf",
+    dpi           = 300,
+)
+```
+
+CRS conversion is handled natively; pass `resolve_xy_fn` only for non-standard
+position formats the built-in logic cannot handle.
+
+### Spec dict keys
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `"name"` | str | yes | Label in legend / panel title |
+| `"x"` | float or `(v, "crs")` | yes | Borehole easting: plain float = model-local m; `(lon, "latlon")` = longitude [°]; `(E_m, "utm")` = UTM easting [m] |
+| `"y"` | float or `(v, "crs")` | yes | Borehole northing: plain float = model-local m; `(lat, "latlon")` = latitude [°]; `(N_m, "utm")` = UTM northing [m] |
+| `"z_top"` | float or `"surface"` | no (def. 0) | Start depth [m, z-down]. `"surface"` → auto from mesh nodes (requires scipy) |
+| `"z_bot"` | float | no (def. 20000) | End depth [m, z-down] |
+| `"dz"` | float | no (def. 200) | Sampling interval [m] |
+| `"lat"` | float | no | Override legend latitude [°] (auto-inferred for `"latlon"` / `"utm"` CRS) |
+| `"lon"` | float | no | Override legend longitude [°] (auto-inferred for `"latlon"` / `"utm"` CRS) |
+| `"color"`, `"ls"`, `"lw"`, `"marker"`, `"alpha"`, … | any | no | Matplotlib `Line2D` kwargs — override `borehole_style` for this trace |
+
+**CRS tag rules:**
+- `"x"` and `"y"` must carry the **same** CRS tag.
+- `(lon, "latlon")` + `(lat, "latlon")` → jointly converted via `fem.latlon_to_model`; legend shows lat/lon automatically.
+- `(E_m, "utm")` + `(N_m, "utm")` → jointly converted via `fem.utm_to_model`; legend shows back-converted lat/lon (requires `utm_zone` / `utm_origin_*`).
+- Plain floats → model-local metres; legend shows x/y in metres unless `"lat"`/`"lon"` keys are also given.
+- Explicit `"lat"`/`"lon"` spec keys always override auto-inferred legend values.
+
+### Function parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `model_file`, `mesh_file` | — | Resistivity block and `mesh.dat` |
+| `borehole_sites` | — | List of spec dicts (see above) |
+| `resolve_xy_fn` | `None` | Optional `(spec) → (x_m, y_m)` override; bypasses built-in CRS logic |
+| `utm_zone` | `1` | UTM zone number |
+| `utm_northern` | `True` | UTM hemisphere flag |
+| `utm_origin_e` | `0.0` | Mesh-centre UTM easting [m] |
+| `utm_origin_n` | `0.0` | Mesh-centre UTM northing [m] |
+| `ocean_value` | `0.25` | Ω·m sentinel for ocean cells |
+| `clim` | `None` | x-axis limits `[rho_min, rho_max]` in Ω·m; `None` = auto |
+| `borehole_style` | `None` | Baseline Matplotlib line kwargs; per-spec keys override |
+| `shared` | `True` | `True` = all traces on one axes; `False` = one panel each |
+| `npz_file` | `None` | NPZ export path; `None` = auto (same stem as `plot_file`, `.npz`); `False` = skip |
+| `plot_file` | `None` | Save path for figure; `None` = `plt.show()` |
+| `dpi` | `200` | Saved-figure DPI |
+
+### NPZ export
+
+The NPZ file contains:
+
+| Array key | Shape | Contents |
+|---|---|---|
+| `header` | scalar str | JSON metadata block |
+| `depth_<name>` | `(n_levels,)` | Depth samples [m, z positive-down] |
+| `rho_<name>` | `(n_levels,)` | Resistivity [Ω·m]; `NaN` where outside mesh or air |
+
+`<name>` is the borehole `"name"` key with spaces replaced by underscores.
+
+**Reading the NPZ:**
+
+```python
+import numpy as np, json
+
+d   = np.load("borehole_logs.npz", allow_pickle=False)
+hdr = json.loads(str(d["header"]))
+for bh in hdr["boreholes"]:
+    depth = d[bh["depth_key"]]   # m, z-down
+    rho   = d[bh["rho_key"]]     # Ohm*m
+    print(bh["name"], depth.shape)
+```
+
+---
+
+## 3-D model plot (`plot_model_3d`)
+
+High-level function for interactive or static 3-D rendering directly from
+`mesh.dat` + `resistivity_block_iterX.dat`.  Requires PyVista.  Called from
+`femtic_mod_plot_3d.py`.
+
+```python
+fviz.plot_model_3d(
+    mesh_file   = "mesh.dat",
+    block_file  = "resistivity_block_iter10.dat",
+
+    scalar      = "log10_resistivity",
+    clim        = [0., 4.],
+    cmap        = "turbo_r",
+
+    slice_x     = [0.],
+    slice_y     = [0.],
+    slice_z     = [5000., 15000.],
+
+    slice_planes = [
+        dict(origin=[0., 0., 8000.], normal=[1., 1., 0.]),
+    ],
+
+    isovalues   = [1., 2., 3.],
+    iso_opacity = 0.35,
+
+    plot_file   = "model_3d.html",
+)
+```
+
+### Parameters summary
+
+| Parameter | Default | Description |
+|---|---|---|
+| `scalar` | `"log10_resistivity"` | Cell-data scalar to display |
+| `clim` | `None` | Colour limits; `None` = PyVista auto |
+| `cmap` | `"turbo_r"` | Colormap for slices and iso-surfaces |
+| `slice_x` | `None` | x-positions of YZ cutting planes (m) |
+| `slice_y` | `None` | y-positions of XZ cutting planes (m) |
+| `slice_z` | `None` | z-positions of XY cutting planes (m) |
+| `slice_planes` | `None` | List of `dict(origin, normal)` for oblique planes |
+| `isovalues` | `None` | Iso-surface levels in scalar units |
+| `iso_opacity` | `0.4` | Iso-surface opacity (0–1) |
+| `iso_cmap` | same as `cmap` | Colormap for iso-surfaces |
+| `show_edges` | `False` | Overlay mesh edges on slices (slow for large grids) |
+| `background` | `"white"` | Scene background colour |
+| `window_size` | `[1600, 900]` | Window / screenshot resolution in pixels |
+| `ocean_value` | `0.3` | Ω·m sentinel for ocean cells |
+| `plot_file` | `None` | `.vtu`/`.vtk` → VTK grid (no render); `.html` → interactive WebGL; `.png`/`.jpg` → screenshot; `None` → live window |
+| `vtu_file` | `None` | Separate VTK grid export written before rendering; cell-centred |
+| `screenshot_scale` | `2` | Anti-aliasing scale for screenshot output |
+
+---
+
+## Ensemble slice plot (`plot_ensemble_slices`)
+
+Joint figure of all ensemble members using exact tet-plane intersection.
+One row per member, columns = slices.  Optional statistical summary rows
+appended at the bottom.
+
+```python
+fviz.plot_ensemble_slices(
+    member_files = [
+        "ensemble/rto_0/resistivity_block_iter10.dat",
+        "ensemble/rto_1/resistivity_block_iter10.dat",
+    ],
+    mesh_file  = "mesh.dat",
+    slices     = [
+        dict(kind="map", z0=5000.),
+        dict(kind="map", z0=15000.),
+        dict(kind="ns",  x0=0.),
+        dict(kind="ew",  y0=0.),
+    ],
+    labels     = ["RTO-0", "RTO-1"],
+    stat_rows  = ["mean", "std"],
+    cmap       = "turbo_r",
+    clim       = [0., 4.],
+    xlim       = [-20000., 20000.],
+    ylim       = [-20000., 20000.],
+    zlim       = [-6000., 15000.],
+    ocean_value     = 0.25,
+    per_member_file = True,
+    plot_file  = "ensemble_slices.pdf",
+    dpi        = 300,
+)
+```
+
+### Parameters summary
+
+| Parameter | Default | Description |
+|---|---|---|
+| `member_files` | — | List of resistivity block paths, one per member |
+| `mesh_file` | — | Shared `mesh.dat` |
+| `slices` | — | Slice-spec list in model-local metres; per-panel `invert_x=True` flips horizontal axis |
+| `labels` | `None` | Row label per member; `None` → "Member 0", … |
+| `stat_rows` | `("mean", "std")` | Stat rows appended after member rows |
+| `cmap` | `"turbo_r"` | Colormap for member / mean / median rows |
+| `clim` | `None` | `[vmin, vmax]` log₁₀(Ω·m); `None` = auto from ensemble |
+| `xlim`, `ylim`, `zlim` | `None` | Global axis limits in model-local metres. `zlim` is positive-down depth (e.g. `[0, 20000]`; negative values represent elevation above the datum, as in the example above) — internally negated to match the curtain panels' `-depth` plot coordinate. |
+| `ocean_color` | `"lightgrey"` | Flat colour for ocean cells |
+| `ocean_value` | `0.25` | Ω·m sentinel for ocean cells |
+| `air_bgcolor` | `None` | Axes facecolor for air / background |
+| `plot_file` | `None` | Joint figure path; `None` → interactive window |
+| `per_member_file` | `False` | Save `_memberN` figures alongside the joint figure |
+| `dpi` | `200` | Saved-figure DPI |
+| `tick_fontsize` | `6` | Font size for axis tick labels and colourbar ticks |
+| `label_fontsize` | `7` | Font size for axis labels, row labels, panel titles, colourbar label, suptitle |
+| `tick_decimals` | `None` | Decimal digits on depth / easting-northing (metres) tick labels, sharing one value. `None` = prior formatting unchanged (`:g` for depth, Matplotlib auto for easting/northing) |
+| `show` | `False` | If `True`, also call `plt.show()` after saving (applies to both the joint figure and any per-member figures from `per_member_file=True`) — displays inline in addition to writing to disk. Useful in interactive environments (Spyder, Jupyter). |
+
+The `"std"` row is rendered on a separate `cividis` colormap anchored at zero.
+NaN (air, missing) cells are excluded from all statistics.
+
+---
+
+## Convergence bar chart (`plot_convergence_bar`)
+
+Bar chart of per-member nRMS (e.g. from `femtic.cnv`), one bar per member,
+coloured by status. Accepts members with no usable nRMS (`None`/NaN —
+missing `femtic.cnv`, missing model file) alongside numeric ones, so the
+caller doesn't need to pre-filter a scan loop before plotting; used by
+`femtic_ens_post.py`'s convergence diagnostic (`MOD_CONV`).
+
+```python
+fviz.plot_convergence_bar(
+    labels    = ["rto_000", "rto_001", "rto_002", "rto_003"],
+    nrms      = [1.10, 1.82, None, 0.95],
+    status    = ["accepted", "rejected_nrms", "missing_cnv", "accepted"],
+    threshold = 1.5,
+    threshold_label = "NRMS_MAX",
+    sort_by   = "nrms",
+    horizontal = True,
+    plot_file = "convergence.pdf",
+    dpi       = 200,
+)
+```
+
+### Parameters summary
+
+| Parameter | Default | Description |
+|---|---|---|
+| `labels` | — | One label per member (e.g. ensemble sub-directory name) |
+| `nrms` | — | One nRMS value per member; `None`/NaN for members with no usable value |
+| `status` | `None` | Explicit per-member status string; `None` → inferred from `nrms`/`threshold` (`"missing"` / `"rejected_nrms"` / `"accepted"`) |
+| `threshold` | `None` | Draws a dashed reference line (e.g. `NRMS_MAX`) and feeds status inference when `status` is omitted |
+| `threshold_label` | `None` | Text next to the threshold line; defaults to `f"threshold = {threshold:g}"` |
+| `sort_by` | `"nrms"` | `"nrms"` (ascending, missing sort last) or `"index"` (original scan order) |
+| `horizontal` | `True` | `True` → horizontal bars (reads better for many members / long labels); `False` → vertical |
+| `log_x` | `False` | Log-scale the value axis |
+| `status_style` | `None` | Override/extend the default `status → dict(color, hatch, legend)` map (defaults: `accepted`=steelblue, `rejected_nrms`=crimson/hatched, `missing_cnv`/`missing_model`/`missing`=grey/hatched) |
+| `value_labels` | `True` | Annotate each bar with its nRMS value (or `"n/a"`) |
+| `stub_frac` | `0.02` | Placeholder bar length (fraction of value-axis range) for missing members, so they still read as a bar |
+| `tick_fontsize` / `label_fontsize` | `7` / `8` | Axis tick / axis-label & title font sizes |
+| `figsize` | `None` | `(w, h)` inches; default scales with member count for horizontal layout |
+| `dpi` | `200` | Saved-figure DPI |
+| `title` | `None` | Auto-generated summary (e.g. `"Convergence: 42 accepted / 5 rejected (nRMS > 1.50) / 2 missing"`) if omitted |
+| `plot_file` | `None` | Output path; `None` → interactive window only (if `show=True`) |
+| `show` | `False` | Also call `plt.show()` |
+| `out` | `True` | Print a one-line confirmation when `plot_file` is saved |
+
+---
+
+## Convergence histogram (`plot_convergence_histogram`)
+
+Binned companion to `plot_convergence_bar` for large ensembles, where one
+bar per member becomes a wall of rows. Bins **accepted** members' nRMS
+into equal-width intervals (the bin range is taken from accepted members
+only, so a wildly over-threshold rejected run can't stretch the axis and
+compress the accepted bulk into a sliver). Rejected members are lumped
+into one aggregate `"rejected"` bar; members with no usable nRMS
+(`None`/NaN) are lumped into one aggregate `"missing"` bar (split by
+sub-status if more than one is present). Both aggregate bars are
+appended after the last numeric bin, separated by a gap. Shares its
+default status → color/hatch/legend map with `plot_convergence_bar` via
+the internal `_conv_status_style_map()` helper.
+
+```python
+fviz.plot_convergence_histogram(
+    nrms      = [1.10, 1.82, None, 0.95, 1.32, 2.05, ...],
+    status    = ["accepted", "rejected_nrms", "missing_cnv", ...],
+    threshold = 1.5,
+    threshold_label = "NRMS_MAX",
+    bins      = "auto",
+    plot_file = "convergence_hist.pdf",
+    dpi       = 200,
+)
+```
+
+### Parameters summary
+
+| Parameter | Default | Description |
+|---|---|---|
+| `nrms` | — | One nRMS value per member; `None`/NaN for members with no usable value |
+| `status` | `None` | Explicit per-member status string; `None` → inferred from `nrms`/`threshold`, same convention as `plot_convergence_bar` |
+| `threshold` | `None` | Draws a dashed reference line (e.g. `NRMS_MAX`) and feeds status inference when `status` is omitted |
+| `threshold_label` | `None` | Text next to the threshold line; defaults to `f"threshold = {threshold:g}"` |
+| `bins` | `"auto"` | `"auto"` → `n_bins_auto` equal-width bins spanning the nRMS range of `binned_statuses` members only; int → that many bins |
+| `n_bins_auto` | `15` | Bin count used when `bins="auto"` |
+| `status_style` | `None` | Override/extend the default status → `dict(color, hatch, legend)` map |
+| `binned_statuses` | `("accepted",)` | Which status(es) get real nRMS-axis bins; the bin range comes from these members only. Everything else gets one aggregate bar (see below) |
+| `show_rejected_bar` | `True` | Append one bar tallying **all** `"rejected_nrms"` members together, regardless of how far over threshold each one is |
+| `show_missing_bar` | `True` | Append one bar tallying members with no usable nRMS (split by `missing_cnv`/`missing_model` if both present) |
+| `log_y` | `False` | Log-scale the count axis |
+| `value_labels` | `True` | Print the total count on top of each bar |
+| `tick_fontsize` / `label_fontsize` | `7` / `8` | Axis tick / axis-label & title font sizes |
+| `figsize` | `None` | `(w, h)` inches; default `(8, 4.5)` |
+| `dpi` | `200` | Saved-figure DPI |
+| `title` | `None` | Auto-generated summary (same convention as `plot_convergence_bar`) if omitted |
+| `plot_file` | `None` | Output path; `None` → interactive window only (if `show=True`) |
+| `show` | `False` | Also call `plt.show()` |
+| `out` | `True` | Print a one-line confirmation when `plot_file` is saved |
+
+Raises `ValueError` if no member has a status in `binned_statuses` (nothing to bin).
+
+---
+
+## Provenance
+
+| Date | Author | Change |
+|---|---|---|
+| 2025-12-23 | vrath | Created (with ChatGPT GPT-5 Thinking). |
+| 2026-03-24 | Claude | Added `plot_data_ensemble` and `plot_model_ensemble`. |
+| 2026-03-29 | Claude | Added `n_sites` to `plot_data_ensemble` (random site draw). Fixed `ocean_value` default: `1e-10` → `3e-1` Ohm·m. Added `ocean_color` (`'lightgrey'`) to all Matplotlib plotting helpers. |
+| 2026-03-30 | Claude | Fixed `plot_data_ensemble`: replaced `fem.read_observe()` with `fem.read_observe_dat()`; added `_observe_to_site_list()`. Fixed ρ_a unit mismatch: FEMTIC Z in SI Ω → scaled by `1/(μ₀×10³)` to mV/km/nT. Split `show_errors` into `show_errors_orig` / `show_errors_pert`. |
+| 2026-04-02 | Claude | Added `xlim`, `ylim`, `zlim` to `plot_model_ensemble`. |
+| 2026-04-03 | Claude | Added `alpha_orig`/`alpha_pert` to `plot_data_ensemble`. Added `mesh_lines`/`mesh_lw`/`mesh_color` to `plot_model_ensemble`, `map_slice_from_cells`, `curtain_from_cells`, `plot_points_matplotlib`. |
+| 2026-04-12 | Claude | Added `comp_markers` / `markersize` / `markevery` to `plot_data_ensemble`. Added `error_style_orig` / `error_style_pert` (`'shade'` / `'bar'` / `'both'`). Multi-panel `what` list redesign; `axs` shape `(n_samples, n_panels)`. |
+| 2026-05-13 | Claude | Added `plot_model_3d` (PyVista 3-D renderer). Added `plot_ensemble_slices` (exact tet-plane intersection, member × slice layout, optional mean/std/median rows). |
+| 2026-05-26 | Claude Sonnet 4.6 | Moved `plot_model_slices` (all inner geometry helpers) and `plot_borehole_logs` from `femtic_mod_plot.py` into this module. Added `import math`, `import os`. Added `vtu_file` to `plot_model_3d`. |
+| 2026-05-31 | vrath / Claude Sonnet 4.6 | Added per-panel `invert_x` key to `plot_model_slices` and `plot_ensemble_slices`. Fixed `_outline_curtain_top` calls (removed). Fixed `read_femtic_mesh` node-coordinate column swap and index assignment. |
+| 2026-06-03 | Claude Sonnet 4.6 | `plot_borehole_logs`: log-scale Ω·m x-axis; `z_top="surface"`; lat/lon legend; per-trace Line2D style; `npz_file` NPZ export with JSON header. Added `_sample_borehole_logs()` private helper (shared by `plot_borehole_logs` and `plot_model_slices`). `plot_model_slices`: added `borehole_sites` / `borehole_style` / `borehole_clim` / `borehole_shared` / `borehole_resolve_xy` for embedded borehole columns. |
+| 2026-06-04 | vrath / Claude Sonnet 4.6 | Script-level split only: `femtic_mod_plot_slice.py` drives `plot_model_slices`; new `femtic_mod_plot_bh.py` drives `plot_borehole_logs`. Both functions and `_sample_borehole_logs` remain in this module. |
+| 2026-07-25 | Claude Sonnet 5 (Anthropic) | `plot_model_slices`: fixed a depth-axis sign bug in the `"ns"`/`"ew"` curtain-panel branches. Polygon y-coordinates are plotted as `-depth`, but the `zlim` override applied `ax.set_ylim([zlim[1], zlim[0]])` with the *positive* depth values, so the axis range never overlapped the plotted data whenever `zlim` was actually set — panels came out blank or upside down. Fixed to negate `zlim` to match the data convention. No effect when `zlim=None` (the previous default), which is why this went unnoticed until callers (`femtic_ens_post.py`'s `MOD_ROI_AUTO`) started passing an explicit `MOD_ZLIM`. |
+| 2026-07-25 | Claude Sonnet 5 (Anthropic) | `plot_ensemble_slices`: fixed two independent bugs in the `"ns"`/`"ew"` curtain panels. (1) This function has its own local `_axis_slice_params` (separate from `plot_model_slices`'s), which set `inv=[True, True, False]` for axis 0/1. The resulting `v_ax` already works out to `[0,0,-1]` (plotted depth = `-depth`), which is already the correct top-shallow/bottom-deep orientation under matplotlib's default axis direction — so the `invert_yaxis()` triggered by `inv=True` was flipping it a second time, putting deep at the top. `inv` is now `[False, False, False]` for these two axes. (2) The per-panel `zlim` override applied `ax.set_ylim([zlim[1], zlim[0]])` using the *positive* depth values directly against that same `-depth` data convention, so a positive `zlim` never overlapped the plotted data — same root cause as the `plot_model_slices` fix above, just a separate code path; now negates `zlim` to `ax.set_ylim([-zlim[1], -zlim[0]])`. (`"map"` panels were never affected by either bug. A spot-check of the `"plane"` panel's `invert_v=True` at a representative strike/dip suggests it's correctly oriented as-is — its `v_ax` sign is strike/dip-dependent, unlike the fixed axis-aligned ns/ew case — but this was not exhaustively verified across all strike/dip combinations.) |
+| 2026-07-25 | Claude Sonnet 5 (Anthropic) | Documentation fix only (no code change in this module): added missing `tick_fontsize` / `label_fontsize` rows to the `plot_model_slices` and `plot_ensemble_slices` parameter tables above — both parameters already existed in the actual function signatures (since the 2026-07-09 / earlier updates) but were never documented here. Prompted by adding `MOD_TICK_FONTSIZE`/`MOD_LABEL_FONTSIZE`/`ENS_TICK_FONTSIZE`/`ENS_LABEL_FONTSIZE` config to the calling scripts (`femtic_ens_post.py`, `femtic_gst_prep.py`, `femtic_rto_prep.py`, `femtic_nss.py`), which previously had no way to override these font sizes at all. |
+| 2026-07-25 | Claude Sonnet 5 (Anthropic) | `plot_model_slices` / `plot_ensemble_slices`: added a `show` parameter (default `False`). Previously a figure was either saved (`plot_file` given) or shown interactively (`plot_file=None`) — never both, so callers running in an interactive environment (Spyder, Jupyter) that also wanted to save to disk never saw the figure inline. `show=True` now calls `plt.show()` in addition to `fig.savefig()` when `plot_file` is given; `show=False` (default) preserves prior save-only behaviour. `plot_ensemble_slices` applies this to both the joint figure and per-member figures (`per_member_file=True`). |
+| 2026-07-27 | Claude Sonnet 5 (Anthropic) | `plot_model_slices`: added `plt.close(fig)` after the save/show block and now returns `fig`, matching `plot_ensemble_slices`'s existing behaviour. Previously the figure was never closed, so the per-member QC/model-slice loops in `femtic_rto_prep.py` and `femtic_gst_prep.py` (`_plot_member_slices`, called once per `VIZ_SAMPLES` entry) leaked one open figure per call, eventually triggering matplotlib's "more than 20 figures have been opened" `RuntimeWarning` and growing memory use over long ensemble runs. No caller changes required — the return value is optional to use. |
+| 2026-07-25 | Claude Sonnet 5 (Anthropic) | `plot_model_slices`: fixed a site-marker elevation sign bug in the `"ns"`/`"ew"`/`"plane"` curtain/plane panels. Mesh polygons plot `v = -z_mesh` (z positive-down), and since `site.dat`'s `elev` column is standard positive-up elevation with `z_mesh = -elev`, a site's correct plotted v-coordinate is `-z_mesh = -(-elev) = +elev` — the same sign the mesh polygons already use. The site-marker code instead plotted `-elev` (the opposite sign): a station on a topographic high (`elev > 0`) appeared *below* the surface and vice versa, while the surrounding topography (drawn from the mesh) was correctly oriented — an inconsistency that reads as "still upside down" even after the two prior 2026-07-25 sign fixes above, which only affected the mesh-polygon axis range/orientation, not this separate site-marker computation. Fixed in all three branches (`ns`/`ew`: `-elev*dz_sc` → `elev*dz_sc`; `plane`: same fix, though that panel's own mesh-polygon orientation uses a separate strike/dip-dependent `v_ax` + `invert_v=True` convention that was not independently re-verified in this pass). |
+| 2026-07-25 | Claude Sonnet 5 (Anthropic) | `plot_model_slices` / `plot_ensemble_slices`: `ns`/`ew` curtain panels' depth axis showed *negative* tick labels (`0, -2.5, -5, ..., -20`) even though the vertical orientation itself (shallow top / deep bottom) was already correct after the prior sign fixes — the negative numbers came from the internal `-depth` plot coordinate leaking into the displayed ticks. Added a `matplotlib.ticker.FuncFormatter` on the y-axis of `ns`/`ew` panels in both functions that displays the tick's positive-down value instead (internal `-15` → label `"15"`), so depth reads as positive-down, while the internal plotting convention (needed for correct stacking order) is unchanged. Not applied to `"plane"` panels (down-dip axis, separate convention, not independently re-verified). |
+| 2026-07-25 | Claude Sonnet 5 (Anthropic) | `plot_model_slices`: found and fixed the actual remaining cause of "still upside down" in the `"ns"`/`"ew"` curtain panels — a **double negation**. `_slice_geometry()` already projects each 3-D intersection point onto `v_ax = [0,0,-1]`, so the `pz` unpacked from its returned `polys` is already `-z_mesh`. The `polys_d` line then negated it *again* (`-pz`), giving effective `v = +z_mesh`: underground structure (large positive `z_mesh`, z positive-down) landed at large positive `v` — entirely outside any sane `zlim` window like `[-20,0]` km — while only the small above-datum sliver (topography) stayed visible, with its sense flipped besides. This exactly matches the reported figures: a thin, topography-shaped coloured strip near the top of the window and a uniform blank/grey field below, even though `"map"` panels at the same depths (a different code path) showed real structure throughout. Fixed by using `pz` directly instead of negating it again, in both the `"ns"` and `"ew"` branches. The `"plane"` branch was checked and does **not** have this bug — it passes `_slice_geometry`'s `polys` straight through with no second transform. No changes were needed to the prior zlim-sign fix, the site-marker elevation-sign fix, or the depth-tick-label formatter above — all three were built on the (correct, as it turns out) assumption that `v = -z_mesh`, which is what this fix now actually produces. |
+| 2026-08-10 | Claude Sonnet 5 (Anthropic) | `plot_model_slices` / `plot_ensemble_slices`: fixed `"ns"` curtain panels plotting **mirrored left-right** relative to true geography — a distinct bug from the depth-axis fixes above (that family of fixes covered the *vertical* axis; this one is the *horizontal* axis of the N-S panel only). In the nested `_axis_slice_params(axis, val)` helper (a separate copy in each function), `u = cross(n, ref)` with the shared `ref=[0,0,1]` gives `u=[0,-1,0]` (negative northing) for `axis=0` ("ns") but `u=[1,0,0]` (positive easting) for `axis=1` ("ew") — an asymmetry from sharing one reference vector across axes, never compensated downstream. Increasing real northing therefore plotted *left* instead of right, while the `"S"`(left)/`"N"`(right) compass-corner labels in `plot_model_slices` assumed the untouched (unmirrored) convention, so data and labels were both wrong in a way that didn't cancel out. Verified against two real ensemble QC figures (`misti_gst_suzuki_ext_err_boot`, `misti_gst_suzuki_rnd_err_boot`): a resistive body sitting north-central in the `"map"` panels appeared on the `"S"` side of the `"N-S"` curtain panel in both. Fixed by flipping `u` only for `axis == 0` (not `v`, which the already-fixed depth handling above relies on being `[0,0,-1]`) in both functions' copies of the helper — `"ew"` and `"map"` panels were unaffected by the bug and are unchanged by the fix. Also added a `tick_decimals` parameter to both functions (see updated parameter tables above; `None` = unchanged formatting) to control decimal digits on depth / easting-northing / lat-lon tick labels. |
+| 2026-08-12 | Claude Sonnet 5 (Anthropic) | Added `plot_convergence_bar()`: standalone bar chart of per-member nRMS (e.g. from `femtic.cnv`), coloured/hatched by status (`"accepted"` / `"rejected_nrms"` / `"missing_cnv"` / `"missing_model"`, inferred from a `threshold` when not supplied explicitly). Members with no usable nRMS (`None`/NaN) render as a small hatched "n/a" stub bar rather than being silently dropped. Sortable by nRMS (ascending, missing sort last) or original order; optional dashed threshold line and per-bar value labels. Used by `femtic_ens_post.py`'s new `MOD_CONV` convergence diagnostic (see `femtic_ens_post_readme.md`). No changes to any existing function. |
+| 2026-08-12 | Claude Sonnet 5 (Anthropic) | Added `plot_convergence_histogram()`: binned, stacked-by-status companion to `plot_convergence_bar` for large ensembles, where a one-bar-per-member chart becomes a wall of rows. Bins nRMS into `"auto"` (default 15) or a fixed number of equal-width bins, stacks accepted/rejected_nrms counts per bin, and tallies members with no usable nRMS into one extra `"missing"` bar appended after the last numeric bin (split by `missing_cnv`/`missing_model` if both present) rather than dropping them. Factored the shared status → color/hatch/legend default map out of `plot_convergence_bar` into a new `_conv_status_style_map()` module helper, used by both functions (no behaviour change to `plot_convergence_bar`). Now `femtic_ens_post.py`'s default `MOD_CONV` rendering (`MOD_CONV_PER_MEMBER=True` switches back to `plot_convergence_bar`; see `femtic_ens_post_readme.md`). |
+| 2026-08-12 | Claude Sonnet 5 (Anthropic) | `plot_convergence_histogram()`: changed the bin range to cover only members whose status is in the new `binned_statuses` parameter (default `("accepted",)`) instead of the full finite nRMS range. Rejected members no longer get real bins at all — they're always lumped into one aggregate `"rejected"` bar (new `show_rejected_bar` parameter, default `True`), appended after the numeric bins next to the existing `"missing"` aggregate bar. A single far-over-threshold rejected member could previously stretch the shared bin range and compress the entire accepted population into an unreadable sliver at one edge of the plot; that's no longer possible. Removed the now-meaningless `status_order` parameter (only `binned_statuses` gets real bins now). `plot_convergence_bar` is unaffected. |
+
+Author: Volker Rath (DIAS)

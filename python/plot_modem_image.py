@@ -740,44 +740,18 @@ def ncpath(name):
     return tomomt.resolve_path(NC_DIR, name)
 
 
-def resolve_iso_levels(data2d, levels_spec, n_auto=ISO_AUTO_N):
-    """Resolve an ISO_LEVELS_* setting into an explicit list of contour
-    levels for one panel.
-
-    "auto" (or None) picks n_auto evenly spaced levels spanning the finite
-    (non-NaN) data range of this particular panel — panels differ, so this
-    is computed fresh each time rather than once globally. An explicit
-    list/tuple is used verbatim, unchanged, so every panel shares the same
-    levels. Returns [] if there's no usable finite data (e.g. an
-    all-air/all-NaN panel) or an explicit level list was empty.
-    """
-    if levels_spec is None or (isinstance(levels_spec, str) and levels_spec.lower() == "auto"):
-        finite = data2d[np.isfinite(data2d)]
-        if finite.size == 0:
-            return []
-        vmin, vmax = float(finite.min()), float(finite.max())
-        if vmin == vmax:
-            return []
-        # Interior points only (exclude the flat/degenerate panel edges)
-        return list(np.linspace(vmin, vmax, n_auto + 2)[1:-1])
-    return list(levels_spec)
-
-
 def draw_iso_contours(ax, x, y, data2d, levels_spec, n_auto=ISO_AUTO_N):
     """Overlay isolines (contours) of data2d on ax, using ISO_STYLE/
     ISO_LABEL/ISO_LABEL_FMT/ISO_LABEL_FONTSIZE. x, y are the same 1-D
     cell-centre coordinate arrays used for the pcolormesh/data itself
     (contour always works from cell centres, regardless of whether the
     filled raster used exact cell edges). No-op if there are no usable
-    levels (see resolve_iso_levels).
+    levels. See tomomt.draw_iso_contours for the implementation.
     """
-    levels = resolve_iso_levels(data2d, levels_spec, n_auto)
-    if not levels:
-        return None
-    cs = ax.contour(x, y, data2d, levels=levels, **ISO_STYLE)
-    if ISO_LABEL:
-        ax.clabel(cs, fmt=ISO_LABEL_FMT, fontsize=ISO_LABEL_FONTSIZE, inline=True)
-    return cs
+    return tomomt.draw_iso_contours(ax, x, y, data2d, levels_spec, ISO_STYLE,
+                                     n_auto=n_auto, label=ISO_LABEL,
+                                     label_fmt=ISO_LABEL_FMT,
+                                     label_fontsize=ISO_LABEL_FONTSIZE)
 
 
 # ------------------------------------------------------------------
@@ -821,37 +795,11 @@ def load_sens_depth_slice(tag, ref_shape, ref_northing, ref_easting):
     Load modem_sens_utm_{tag}.nc for the horizontal-slice loop, re-oriented
     to match the resistivity slice's own (northing, easting) orientation.
     Returns None if sensitivity is disabled or the file doesn't exist.
+    See tomomt.load_sens_depth_slice for the implementation.
     """
-    if not USE_SENSITIVITY:
-        return None
     path = ncpath(f"modem_sens_utm_{tag}.nc")
-    if not os.path.exists(path):
-        print(f"  WARNING: {path} not found — sensitivity masking/shading "
-              f"is disabled for this depth slice. Check that "
-              f"precompute.py found the .sns file (look for its "
-              f"own WARNING) and that OUTPUT_DIR there matches NC_DIR here.")
-        return None
-    _da = xr.open_dataarray(path)
-    sy = _da["northing"].values
-    sx = _da["easting"].values
-    sv = _da.values.copy().astype(float)
-    _da.close()
-
-    if sv.shape[0] != len(sy):
-        sv = sv.T
-    if sy[0] > sy[-1]:
-        sy = sy[::-1]
-        sv = sv[::-1, :]
-    if sx[0] > sx[-1]:
-        sx = sx[::-1]
-        sv = sv[:, ::-1]
-
-    if sv.shape != ref_shape or not (np.allclose(sy, ref_northing) and
-                                     np.allclose(sx, ref_easting)):
-        print(f"  WARNING: {path} grid doesn't match the resistivity slice "
-              f"— skipping shading/blanking for this depth.")
-        return None
-    return sv
+    return tomomt.load_sens_depth_slice(path, USE_SENSITIVITY, ref_shape,
+                                         ref_northing, ref_easting)
 
 
 # ------------------------------------------------------------------

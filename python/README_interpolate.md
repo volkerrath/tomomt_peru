@@ -92,15 +92,6 @@ and converts every free (non-fixed) element's centroid into a
 auto-bounds computation and the RBF/kriging/IDW/nearest interpolators
 exactly like a ModEM or seismic source.
 
-For plotting the FEMTIC mesh's own exact geometry directly (not
-interpolated onto a joint grid) — depth-slice maps and vertical
-sections built from real plane/tetrahedron intersections, the FEMTIC
-counterpart to `plot_modem_mesh.py` — see `plot_femtic_mesh.py`
-(`README_plot_femtic_mesh.md`). It shares this section's
-`FEMTIC_DIR`/`FEMTIC_ORIGIN_E_M`/`FEMTIC_ORIGIN_N_M`/
-`FEMTIC_DEPTH_OFFSET_KM`/`FEMTIC_INCLUDE_FIXED`/`FEMTIC_OCEAN` settings
-by name, so the same values apply in both places.
-
 **Coordinate conversion.** FEMTIC's `mesh.dat` stores node coordinates
 in *model-local metres*: x/y are UTM easting/northing offset by the
 mesh's own local origin (axes aligned with UTM east/north, no rotation

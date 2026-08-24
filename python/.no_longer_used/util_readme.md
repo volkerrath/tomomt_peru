@@ -1,0 +1,312 @@
+# util.py — General-purpose utilities for Py4MT
+
+`util.py` is a collection of general-purpose helper functions used across the
+Py4MT package. It covers workspace persistence, coordinate transforms, file
+manipulation, grid generation, geometry, and numerical utilities.
+
+---
+
+## HDF5 workspace save/load
+
+MATLAB-like workspace persistence using HDF5. Numeric arrays, scalars,
+strings, and JSON-serializable objects are stored; non-serializable objects
+are skipped with a warning.
+
+- `save_workspace_hdf5(filename, namespace=None)` — save filtered namespace
+- `load_workspace_hdf5(filename, namespace=None)` — restore into namespace
+
+---
+
+## Module introspection
+
+- `list_module_callables(module, public_only=False)` — list callable objects
+  defined in a module
+- `running_in_notebook()` — detect Jupyter notebook environment
+- `runtime_env()` — detect runtime (spyder, jupyter, ipython, python)
+- `list_functions(filename)` — print function names from a Python source file
+
+---
+
+## Coordinate projections (pyproj)
+
+All projection functions use the modern `pyproj.Transformer` API.
+
+| Function | Conversion |
+|----------|------------|
+| `get_utm_zone(lat, lon)` | Get EPSG code for UTM zone |
+| `get_local_crs(lon, lat)` | Query projected CRSs near a point |
+| `proj_latlon_to_utm` | WGS84 → UTM |
+| `proj_utm_to_latlon` | UTM → WGS84 |
+| `proj_latlon_to_itm` | WGS84 → Irish Transverse Mercator |
+| `proj_itm_to_latlon` | ITM → WGS84 |
+| `proj_itm_to_utm` | ITM → UTM |
+| `proj_utm_to_itm` | UTM → ITM |
+| `project_wgs_to_geoid` | Ellipsoid height → geoid (EGM2008) |
+| `project_utm_to_geoid` | UTM + ellipsoid → geoid |
+| `project_gk_to_latlon` | Gauss-Krüger → WGS84 |
+
+---
+
+## File and string utilities
+
+- `get_filelist(searchstr, searchpath)` — glob-like file listing
+- `get_files(SearchString, SearchDirectory)` — simple file filter
+- `strcount(keyword, fname)` — count keyword occurrences in a file
+- `strdelete(keyword, fname_in, fname_out)` — delete lines containing keyword
+- `strreplace(key_in, key_out, fname_in, fname_out)` — find-and-replace in file
+- `symlink(src, dst)` — create symlink (`ln -sf`)
+- `filecopy(src, dst)` — copy file/directory (`cp -f`)
+- `make_pdf_catalog(workdir, pdflist, filename)` — merge PDFs into one catalog
+
+---
+
+## Archive unpacking and packing
+
+- `unpack_compressed(directories, *, recurse=False, remove_archive=False, verbose=True)` — unpack all compressed archives found in one or more directories
+- `pack_compressed(directories, method="zip", *, outdir=None, archive_name=None, recurse=False, remove_source=False, verbose=True)` — pack one or more directories into compressed archives
+
+**`unpack_compressed`** — supported formats: `.zip`, `.tar`, `.tar.gz` / `.tgz`, `.tar.bz2` / `.tbz2`, `.tar.xz` / `.txz`, and single-file `.gz`, `.bz2`, `.xz`.  
+Multi-file archives are extracted into the same directory as the archive; single-file compressed files are decompressed in-place.  
+`recurse=True` walks sub-directories. `remove_archive=True` deletes each archive after successful extraction.  
+Returns a `list[Path]` of successfully processed archives.
+
+```python
+# Unpack everything in two directories
+unpack_compressed(["/data/raw", "/data/aux"])
+
+# Recursive, clean up afterwards
+unpack_compressed("/data/raw", recurse=True, remove_archive=True)
+```
+
+**`pack_compressed`** — each directory produces one archive named after that directory (or `archive_name` for single-directory calls). Archives land next to their source, or in `outdir` if given.
+
+| `method` | Output suffix |
+|----------|--------------|
+| `"zip"`  | `.zip`       |
+| `"tar"`  | `.tar`       |
+| `"tgz"`  | `.tar.gz`    |
+| `"tbz2"` | `.tar.bz2`   |
+| `"txz"`  | `.tar.xz`    |
+
+`recurse=True` includes sub-directories. `remove_source=True` deletes the source directory after successful packing.  
+Returns a `list[Path]` of created archives.
+
+```python
+# Pack two directories as gzip-compressed tarballs
+pack_compressed(["/data/raw", "/data/aux"], method="tgz")
+
+# Pack into a specific output directory, recursive, named explicitly
+pack_compressed("/data/survey", method="zip", outdir="/backup",
+                archive_name="survey_2026", recurse=True)
+```
+
+
+---
+
+## Script queue runner
+
+- `run_queue(scripts, *, mode="strict", logfile=None, verbose=True)` — run a sequence of scripts or shell commands sequentially, with glob expansion and timestamped logging
+
+Each entry in *scripts* may be a literal script path, a plain shell command string, or a glob pattern (e.g. `"./stage2_*.sh"`). Globs are expanded and sorted before execution. Output (stdout + stderr combined) is streamed live and written to the log.
+
+| `mode`      | Behaviour on failure |
+|-------------|----------------------|
+| `"strict"`  | raises `RuntimeError` immediately (default) |
+| `"lenient"` | logs the failure, continues with remaining scripts |
+
+`logfile=None` auto-generates a timestamped name (`run_queue_YYYYMMDD_HHMMSS.log`). Pass `logfile=False` to disable file logging entirely.
+
+Returns a dict with `"resolved"` (expanded script list), `"ok"`, `"failed"` (list of `(script, exit_code)` tuples), and `"logfile"`.
+
+```python
+# Run three scripts strictly; log to default timestamped file
+run_queue(["./setup.sh", "./stage1_*.sh", "./finalize.sh"])
+
+# Lenient mode, explicit log path
+run_queue(["./prep.sh", "./jobs/step?.sh"], mode="lenient",
+          logfile="job_run.log")
+
+# Mix of script paths and plain commands
+run_queue(["./init.sh", "python process.py --site A01", "./cleanup.sh"])
+```
+---
+
+## Grid generation
+
+- `gen_grid_latlon(LatLimits, nLat, LonLimits, nLon)` — equidistant lat/lon grid
+- `gen_grid_utm(XLimits, nX, YLimits, nY)` — equidistant metric grid
+- `gen_searchgrid(Points, XLimits, dX, YLimits, dY)` — bin points into a 2-D grid
+
+---
+
+## Geometry
+
+- `point_inside_polygon(x, y, poly)` — point-in-polygon test
+- `choose_data_poly(Data, PolyPoints)` — select data inside a polygon
+- `choose_data_rect(Data, Corners)` — select data inside a rectangle
+- `proj_to_line(x, y, line)` — project a point onto a line
+
+---
+
+## Numerical utilities
+
+- `nan_like(a)` — NaN-filled array matching shape of `a`
+
+> **Moved to `inverse.py` (2026-05-25):** `KLD`, `dctn`, `idctn`,
+> `fractrans`, `calc_lc_corner`, `curvature`, `circumradius`,
+> `circumcenter`, `calc_resnorm`, `calc_rms`.
+> Use `from inverse import <name>` directly.
+
+---
+
+## Rotation matrices
+
+- `rot_x(angle_deg)`, `rot_y(angle_deg)`, `rot_z(angle_deg)` — single-axis rotation
+- `rot_full(T, angle_deg_x, angle_deg_y, angle_deg_z)` — combined rotation of a tensor
+
+---
+
+## Other helpers
+
+- `dd(lat, lon)` — DMS string to decimal degrees
+- `stop(s)` — exit with message
+- `unique(seq)` — unique elements preserving order
+- `bytes2human(n)` — human-readable byte sizes
+- `nearly_equal(a, b, sig_fig)` — approximate float comparison
+- `check_env(envar)` — verify conda environment is active
+- `dict_to_namespace(d)` — dict → `SimpleNamespace`
+- `print_title(version, fname)` — print version and file info
+- `splitall(path)` — split a path into all its components
+- `dictget(d, *keys)` — multi-key dict lookup
+
+---
+
+## FT sign-convention correction (`ft_convention.py`)
+
+A companion module — **not part of `util.py`** — for correcting the
+Fourier-transform sign convention of MT transfer functions loaded from
+instruments with the e⁺ⁱωᵗ convention (Phoenix MTU series).
+
+`data_proc.load_edi` handles this automatically via the `manufacturer`
+parameter.  `ft_convention.py` provides the same logic as standalone
+functions for post-hoc correction of already-loaded dicts.
+
+| Function | Description |
+|----------|-------------|
+| `correct_ft_convention(data_dict, *, from_convention, to_convention)` | In-place convention correction with full bookkeeping |
+| `apply_conjugation(data_dict)` | Low-level conjugation of Z, T, and P |
+| `is_corrected(data_dict)` | Returns `True` if dict is already in standard e⁻ⁱωᵗ convention |
+| `correct_batch(sites, *, from_convention, to_convention)` | Apply correction to a list of site dicts |
+
+Constants `CONV_STANDARD = "e-iwt"`, `CONV_PHOENIX = "e+iwt"`,
+`PHOENIX_MANUFACTURERS`, `STANDARD_MANUFACTURERS` are exported for
+use in scripts.
+
+```python
+import ft_convention
+
+# Correct a Phoenix EDI that was loaded without the manufacturer flag
+site = data_proc.load_edi("SITE_PHX.edi")        # loaded as Metronix → wrong Im
+ft_convention.correct_ft_convention(site, from_convention="e+iwt")
+print(site["ft_convention"])  # "e+iwt_corrected"
+
+# Check before acting
+if not ft_convention.is_corrected(site):
+    ft_convention.correct_ft_convention(site, from_convention="e+iwt")
+
+# Preferred: pass manufacturer at load time — no post-hoc fix needed
+site = data_proc.load_edi("SITE_PHX.edi", manufacturer="phoenix")
+```
+
+---
+
+## Petrophysical resistivity & permeability models
+
+Standard models for relating fluid, rock, and electrical properties.
+All resistivities in Ω·m; permeability internally in m², reported in mD;
+grain diameter input in µm.
+
+### Brine conductivity / resistivity
+
+| Function | Description |
+|----------|-------------|
+| `brine_conductivity_sen_goode(salinity_ppm, temp_c)` | NaCl conductivity σ_w [S/m] via Sen & Goode (1992); valid 0–300 °C, 0–300 g/L |
+| `brine_conductivity_sen_goode_mol(C, temp_c)` | Same model accepting molarity [mol/L] directly |
+| `brine_resistivity_sen_goode(salinity_ppm, temp_c)` | Convenience wrapper returning Rw = 1/σ_w [Ω·m] |
+| `brine_resistivity(salinity_ppm, temp_c)` | Legacy Arps/Hilchie empirical approximation (kept for back-compat) |
+
+### Archie model (clean formation)
+
+`archie(phi, Sw, Rw, *, m=2.0, n=2.0, a=1.0) → ArchieResult`
+
+Implements Archie's first and second laws: F = a/φᵐ, Ro = F·Rw, Rt = Ro/Swⁿ.
+Returns `ArchieResult` with fields `F`, `Ro`, `Rt`, `RI`, `Sw`, `Rw`.
+
+`solve_Sw_archie(Rt, phi, Rw, *, m, n, a) → float` — closed-form inversion for Sw.
+
+### Simandoux model (shaly sand)
+
+`simandoux(phi, Sw, Rw, Vsh, Rsh, *, m=2.0, n=2.0, a=1.0) → SimandouxResult`
+
+Adds a parallel clay conduction path to Archie.  Reliable for Vsh < 0.5.
+Returns `SimandouxResult` with fields `F`, `Ro`, `Rt`, `RI`, `Sw`, `Vsh`, `Rw`.
+
+`solve_Sw_simandoux(Rt, phi, Rw, Vsh, Rsh, *, m, n, a, tol, maxiter) → float` — Newton-Raphson inversion.
+
+### Dual-porosity / fractured model
+
+`dual_porosity(phi_matrix, Sw_matrix, Rw, phi_frac, *, Sw_frac=1.0, m_matrix=2.0, n_matrix=2.0, m_frac=1.3, n_frac=1.5, a_matrix=1.0, a_frac=1.0) → DualPorosityResult`
+
+Warren-Root parallel resistivity network: matrix and fracture networks each
+follow Archie's law with independent exponents; combined in electrical parallel.
+Returns `DualPorosityResult` with per-system and combined Rt, Ro, RI, F fields.
+
+### RGPZ permeability model
+
+`rgpz(phi, d_geom_um, *, m=2.0, a_pack=8/3) → RGPZResult`
+
+Derives permeability from porosity, cementation exponent, and geometric-mean
+grain diameter following Glover et al. (2006): k = d̄²·φ^(3m) / (4·a·m²).
+Returns `RGPZResult` with `k_m2`, `k_mD`, `F`, `S`, `tortuosity`.
+
+`rgpz_from_formation_factor(F, phi, d_geom_um, *, a_pack) → RGPZResult` — derives m from a measured F then calls `rgpz`.
+
+`kozeny_carman(phi, d_geom_um, *, tau=2.5) → float` — Kozeny-Carman permeability [mD] for comparison.
+
+### Hashin-Shtrikman bounds
+
+`hashin_shtrikman_two_phase(sigma_1, sigma_2, f1) → HSTwoPhaseResult`
+
+Exact HS± conductivity bounds, HS geometric-mean mixing, Voigt, and Reuss for
+a two-component composite. Returns both σ and R (= 1/σ) for all bounds.
+
+`hashin_shtrikman_n_phase(sigmas, fractions) → HSNPhaseResult`
+
+General N-phase HS bounds.  `sigmas` and `fractions` are equal-length sequences;
+fractions must sum to 1.
+
+```python
+from util import (
+    brine_resistivity_sen_goode, archie, simandoux,
+    dual_porosity, rgpz, hashin_shtrikman_two_phase,
+)
+
+Rw = brine_resistivity_sen_goode(30_000, 60)   # 30 000 ppm NaCl, 60 °C
+r  = archie(phi=0.20, Sw=0.70, Rw=Rw)
+print(f"Rt = {r.Rt:.2f} Ω·m")
+
+k  = rgpz(phi=0.20, d_geom_um=150.0, m=2.0)
+print(f"k  = {k.k_mD:.3f} mD")
+```
+
+**References** — Archie (1942); Simandoux (1963); Warren & Root (1963);
+Glover et al. (2006); Sen & Goode (1992); Hashin & Shtrikman (1962).
+
+---
+
+Author: Volker Rath (DIAS)
+Modified: 2026-03-25 — added ft_convention.py section; Claude Sonnet 4.6 (Anthropic)  
+Modified: 2026-03-26 — added unpack_compressed(), pack_compressed(), run_queue() sections; Claude Sonnet 4.6 (Anthropic)
+Modified: 2026-04-02 — added petrophysical models section (merged from resistivity_models.py); Claude Sonnet 4.6 (Anthropic)
+Modified: 2026-05-25 — moved numerical utilities (KL divergence, L-curve, DCT, residual norms) to `inverse.py`; removed shims; Claude Sonnet 4.6 (Anthropic)
+Modified: 2026-07-27 — `utm_zone_from_latlon`: raises a clear, actionable `ValueError` when `lat`/`lon` are `None` (or non-numeric) instead of an opaque `TypeError` from `float(None)`; also validates that a real `lat` is still supplied when `override` is given (needed for the hemisphere sign). No change to normal-case behavior. Claude Sonnet 5 (Anthropic)

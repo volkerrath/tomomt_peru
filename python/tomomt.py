@@ -12,6 +12,17 @@ into three or four scripts independently. Imported by ``cluster.py``,
 ``crossplots.py``, ``interpolate.py``, ``plot_joint.py``, ``precompute.py``,
 and ``structure.py``.
 
+A third round (2026-08) consolidated the read-side subset of
+``femtic.py`` and ``modem.py`` actually used by this pipeline
+(``interpolate.py``/``plot_femtic_mesh.py``'s FEMTIC mesh+resistivity-
+block readers; ``precompute.py``'s ModEM model/data/topo readers), so
+that ``tomomt.py`` is now the *only* local module any pipeline script
+needs to import. This also removes femtic.py's own hard, unconditional
+``from ensembles import (...)`` module-level dependency, which every
+importer previously inherited even when only reading a mesh file. See
+the "SECTION: FEMTIC I/O" / "SECTION: ModEM I/O" blocks below for what
+was carried over and, explicitly, what was left behind.
+
 Two families of helpers live here, both are genuinely duplicated,
 run-independent pieces pulled out of the scripts above -- not things
 guessed at or added speculatively:
@@ -71,6 +82,7 @@ AI-generated code — review before use in production.
 """
 
 import glob
+import math
 import os
 import re
 import zipfile
@@ -79,6 +91,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
+import xarray as xr
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
@@ -354,6 +367,51 @@ def sens_data_alpha(sens, low, high, base_alpha):
         frac = np.clip((sens - low) / (high - low), 0.0, 1.0)
         alpha = frac * base_alpha
     return np.where(np.isnan(sens), 0.0, alpha)
+
+
+def load_sens_depth_slice(path, use_sensitivity, ref_shape, ref_northing, ref_easting):
+    """
+    Load a precompute.py horizontal sensitivity/resolution slice NetCDF
+    (a single DataArray with northing/easting coords, in either
+    orientation) and re-orient it to match a reference resistivity
+    slice's own (northing, easting) orientation. Returns None if
+    `use_sensitivity` is False, the file doesn't exist, or the loaded
+    grid doesn't match (ref_shape, ref_northing, ref_easting) — in which
+    case shading/blanking for that depth is simply skipped, with a
+    printed WARNING explaining why.
+
+    Was duplicated identically in plot_modem_image.py and
+    plot_modem_mesh.py's own per-depth-slice loops.
+    """
+    if not use_sensitivity:
+        return None
+    if not os.path.exists(path):
+        print(f"  WARNING: {path} not found — sensitivity masking/shading "
+              f"is disabled for this depth slice. Check that "
+              f"precompute.py found the .sns file (look for its "
+              f"own WARNING) and that OUTPUT_DIR there matches NC_DIR here.")
+        return None
+    _da = xr.open_dataarray(path)
+    sy = _da["northing"].values
+    sx = _da["easting"].values
+    sv = _da.values.copy().astype(float)
+    _da.close()
+
+    if sv.shape[0] != len(sy):
+        sv = sv.T
+    if sy[0] > sy[-1]:
+        sy = sy[::-1]
+        sv = sv[::-1, :]
+    if sx[0] > sx[-1]:
+        sx = sx[::-1]
+        sv = sv[:, ::-1]
+
+    if sv.shape != ref_shape or not (np.allclose(sy, ref_northing) and
+                                      np.allclose(sx, ref_easting)):
+        print(f"  WARNING: {path} grid doesn't match the resistivity slice "
+              f"— skipping shading/blanking for this depth.")
+        return None
+    return sv
 
 
 # =====================================================================
@@ -778,6 +836,80 @@ def draw_annotation(ax, text, pos, style):
 
 
 # =====================================================================
+# Contour-level resolution / isoline overlay (depth-slice and
+# vertical-section plots)
+# =====================================================================
+def resolve_iso_spec(spec, key):
+    """
+    An ISO_LEVELS_* setting may be a single "auto"/list (applied to
+    every field) or a dict keyed by field name for per-field control.
+    Fields absent from the dict default to "auto".
+
+    Was duplicated identically in plot_joint.py and plot_seis.py.
+    """
+    if isinstance(spec, dict):
+        return spec.get(key, "auto")
+    return spec
+
+
+def resolve_iso_levels(data2d, levels_spec, n_auto=6):
+    """
+    Resolve an (already per-field-resolved, via resolve_iso_spec if
+    needed) ISO_LEVELS_* setting into an explicit list of contour levels
+    for one panel. "auto"/None picks n_auto evenly spaced levels
+    spanning the finite (non-NaN) data range of this particular panel —
+    panels differ, so this is computed fresh each time rather than once
+    globally. An explicit list/tuple is used verbatim, unchanged, so
+    every panel shares the same levels. Returns [] if there's no usable
+    finite data (e.g. an all-air/all-NaN panel) or an explicit level
+    list was empty.
+
+    Was duplicated identically in plot_joint.py, plot_modem_image.py,
+    plot_modem_mesh.py, and plot_seis.py.
+    """
+    if levels_spec is None or (isinstance(levels_spec, str) and levels_spec.lower() == "auto"):
+        finite = data2d[np.isfinite(data2d)]
+        if finite.size == 0:
+            return []
+        vmin, vmax = float(finite.min()), float(finite.max())
+        if vmin == vmax:
+            return []
+        # Interior points only (exclude the flat/degenerate panel edges)
+        return list(np.linspace(vmin, vmax, n_auto + 2)[1:-1])
+    return list(levels_spec)
+
+
+def draw_iso_contours(ax, x, y, data2d, levels_spec, iso_style, n_auto=6,
+                       label=False, label_fmt="%.2g", label_fontsize=6, key=None):
+    """
+    Overlay isolines of data2d on ax. x/y may be 1-D (regular grid) or
+    2-D matching data2d's shape (curvilinear grid's own aux coords) —
+    ax.contour() accepts either. No-op if there are no usable levels.
+
+    iso_style, label/label_fmt/label_fontsize are the caller's own
+    ISO_STYLE/ISO_LABEL/ISO_LABEL_FMT/ISO_LABEL_FONTSIZE settings,
+    passed explicitly rather than read from the caller's module
+    namespace — same convention as draw_north_arrow/clipped_labels/
+    draw_annotation above. `key`, if given, resolves a per-field entry
+    via resolve_iso_spec() first (levels_spec may then be a dict keyed
+    by field name); omit it when there's only one field and levels_spec
+    is always a plain "auto"/list.
+
+    Was duplicated (with only the presence/absence of the `key`
+    resolution step differing) in plot_joint.py, plot_modem_image.py,
+    plot_modem_mesh.py, and plot_seis.py.
+    """
+    spec = resolve_iso_spec(levels_spec, key) if key is not None else levels_spec
+    levels = resolve_iso_levels(data2d, spec, n_auto)
+    if not levels:
+        return None
+    cs = ax.contour(x, y, data2d, levels=levels, **iso_style)
+    if label:
+        ax.clabel(cs, fmt=label_fmt, fontsize=label_fontsize, inline=True)
+    return cs
+
+
+# =====================================================================
 # Vertical-slice profile helpers (generic — no dependence on a specific
 # script's VSLICES list or data arrays)
 # =====================================================================
@@ -1193,3 +1325,971 @@ def build_map_figure(fig_width_cm, xmin, xmax, ymin, ymax, colorbar_settings,
     map_w_in, map_h_in = map_panel_size_in(fig_width_cm, xmin, xmax, ymin, ymax)
     return build_panel_figure(map_w_in, map_h_in, colorbar_settings,
                                size_label=size_label)
+
+
+# =====================================================================
+# SECTION: FEMTIC I/O (consolidated from femtic.py)
+# =====================================================================
+# Pulled in so interpolate.py / plot_femtic_mesh.py no longer need to
+# import femtic.py for kind="femtic_points" sources. Only the read-side
+# subset actually exercised by this pipeline is here -- not a full port
+# of femtic.py (6500+ lines covering data-file I/O, distortion decoding,
+# the resistivity-block read->NPZ->modify->write workflow, NPZ<->VTK/
+# NetCDF conversion, ensemble generation, and a CLI). Left out
+# deliberately:
+#   - insert_model / read_model_to_npz / modify_model_npz /
+#     write_model_from_npz / summarise_model_file / _print_model_summary
+#     -- the NPZ round-trip and inversion-side write path; this pipeline
+#     only ever reads a resistivity block for visualisation.
+#   - get_roughness / make_prior_cov / matrix_reduce / etc. (femtic.py's
+#     own Section 2) -- these are re-exports from ensembles.py, which is
+#     exactly the hard unconditional-import dependency this consolidation
+#     removes; nothing here should reintroduce it.
+#   - tet_volumes / build_region_geometry / _point_in_tet /
+#     extract_borehole_log / utm_to_model / latlon_to_model and the rest
+#     of femtic.py's geometry/coordinate helpers -- not called by any
+#     consumer script today. Add them here if/when a script needs them,
+#     rather than porting speculatively.
+#
+# estimate_utm_origin() below originally reached its lat/lon<->UTM
+# conversion through femtic.py's own `_utl()` -> bare `import util`.
+# util.py's latlon_to_utm_zn()/utm_to_latlon_zn() are copied in verbatim
+# below (pyproj primary path + dependency-free Helmert/Bowring-series
+# fallback, accurate to <1mm within a zone, in case pyproj is ever
+# unavailable at runtime) rather than re-derived, so this keeps femtic.py's
+# exact original numerics instead of a from-scratch reimplementation.
+# util.py itself is NOT made an import of tomomt.py -- it's a 3200-line
+# general-purpose module (workspace HDF5 I/O, petrophysics, archiving,
+# ...) and only these two functions are actually exercised by this
+# pipeline's FEMTIC-origin workflow.
+
+_ANISO_ISO = 0      # isotropic
+_ANISO_TI = 1       # transverse isotropy (rhoXX, rhoYY, strike, dip)
+_ANISO_GA = 2       # general anisotropy  (rhoXX, rhoYY, rhoZZ, strike, dip, slant)
+
+
+def latlon_to_utm_zn(lat, lon, zone, northern):
+    """Convert WGS-84 geographic coordinates to UTM easting/northing [m].
+
+    Takes an explicit zone number and hemisphere flag (rather than an
+    EPSG code). Uses pyproj when available; falls back to the Helmert /
+    Bowring series (accurate to <1mm within a single UTM zone) when
+    pyproj is absent. Copied from util.py (VR/Claude Sonnet 4.6).
+
+    Parameters
+    ----------
+    lat, lon : decimal degrees (positive = N / E)
+    zone : UTM zone number 1-60
+    northern : True -> Northern hemisphere (false northing = 0)
+
+    Returns
+    -------
+    E_m, N_m : UTM easting and northing in metres
+    """
+    try:
+        hemi = "north" if northern else "south"
+        crs = f"+proj=utm +zone={zone} +{hemi} +datum=WGS84 +units=m"
+        tr = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+        E_m, N_m = tr.transform(float(lon), float(lat))
+        return float(E_m), float(N_m)
+    except Exception:
+        pass
+
+    # Helmert / Bowring series fallback (no external dependency)
+    a = 6_378_137.0
+    f = 1.0 / 298.257_223_563
+    k0 = 0.9996
+    E0 = 500_000.0
+    N0 = 0.0 if northern else 10_000_000.0
+    e2 = 2.0 * f - f * f
+    lon0_deg = (zone - 1) * 6 - 180 + 3
+    lat_r = np.radians(float(lat))
+    lon_r = np.radians(float(lon))
+    lon0 = math.radians(lon0_deg)
+    N_r = a / np.sqrt(1.0 - e2 * np.sin(lat_r) ** 2)
+    T = np.tan(lat_r) ** 2
+    C = e2 / (1.0 - e2) * np.cos(lat_r) ** 2
+    A2 = np.cos(lat_r) * (lon_r - lon0)
+    e4, e6 = e2 ** 2, e2 ** 3
+    M = a * (
+        (1.0 - e2 / 4.0 - 3.0 * e4 / 64.0 - 5.0 * e6 / 256.0) * lat_r
+        - (3.0 * e2 / 8.0 + 3.0 * e4 / 32.0 + 45.0 * e6 / 1024.0) * np.sin(2.0 * lat_r)
+        + (15.0 * e4 / 256.0 + 45.0 * e6 / 1024.0) * np.sin(4.0 * lat_r)
+        - (35.0 * e6 / 3072.0) * np.sin(6.0 * lat_r)
+    )
+    E_m = E0 + k0 * N_r * (
+        A2
+        + (1.0 - T + C) * A2 ** 3 / 6.0
+        + (5.0 - 18.0 * T + T ** 2 + 72.0 * C - 58.0 * e2 / (1.0 - e2)) * A2 ** 5 / 120.0
+    )
+    N_m = N0 + k0 * (
+        M + N_r * np.tan(lat_r) * (
+            A2 ** 2 / 2.0
+            + (5.0 - T + 9.0 * C + 4.0 * C ** 2) * A2 ** 4 / 24.0
+            + (61.0 - 58.0 * T + T ** 2 + 600.0 * C
+               - 330.0 * e2 / (1.0 - e2)) * A2 ** 6 / 720.0
+        )
+    )
+    return float(E_m), float(N_m)
+
+
+def utm_to_latlon_zn(E_m, N_m, zone, northern):
+    """Convert UTM easting/northing [m] to WGS-84 (lat, lon) decimal degrees.
+
+    Takes an explicit zone number and hemisphere flag (rather than an
+    EPSG code). Uses pyproj when available; falls back to the iterative
+    inverse Helmert series (accurate to <1mm within a single UTM zone)
+    when pyproj is absent. Copied from util.py (VR/Claude Sonnet 4.6).
+
+    Parameters
+    ----------
+    E_m, N_m : UTM easting and northing in metres
+    zone : UTM zone number 1-60
+    northern : True -> Northern hemisphere (false northing = 0)
+
+    Returns
+    -------
+    lat, lon : decimal degrees (positive = N / E)
+    """
+    try:
+        hemi = "north" if northern else "south"
+        crs = f"+proj=utm +zone={zone} +{hemi} +datum=WGS84 +units=m"
+        tr = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+        lon, lat = tr.transform(float(E_m), float(N_m))
+        return float(lat), float(lon)
+    except Exception:
+        pass
+
+    # Helmert inverse series fallback (Bowring / Snyder)
+    a = 6_378_137.0
+    f = 1.0 / 298.257_223_563
+    k0 = 0.9996
+    E0 = 500_000.0
+    N0 = 0.0 if northern else 10_000_000.0
+    e2 = 2 * f - f * f
+    e1 = (1 - math.sqrt(1 - e2)) / (1 + math.sqrt(1 - e2))
+    lon0 = math.radians((zone - 1) * 6 - 180 + 3)
+    x = float(E_m) - E0
+    y = float(N_m) - N0
+    M = y / k0
+    mu = M / (a * (1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256))
+    lat1 = (mu
+            + (3 * e1 / 2 - 27 * e1 ** 3 / 32) * np.sin(2 * mu)
+            + (21 * e1 ** 2 / 16 - 55 * e1 ** 4 / 32) * np.sin(4 * mu)
+            + (151 * e1 ** 3 / 96) * np.sin(6 * mu)
+            + (1097 * e1 ** 4 / 512) * np.sin(8 * mu))
+    N1 = a / np.sqrt(1 - e2 * np.sin(lat1) ** 2)
+    T1 = np.tan(lat1) ** 2
+    C1 = e2 / (1 - e2) * np.cos(lat1) ** 2
+    R1 = a * (1 - e2) / (1 - e2 * np.sin(lat1) ** 2) ** 1.5
+    D = x / (N1 * k0)
+    lat = lat1 - (N1 * np.tan(lat1) / R1) * (
+        D ** 2 / 2
+        - (5 + 3 * T1 + 10 * C1 - 4 * C1 ** 2 - 9 * e2 / (1 - e2)) * D ** 4 / 24
+        + (61 + 90 * T1 + 298 * C1 + 45 * T1 ** 2
+           - 252 * e2 / (1 - e2) - 3 * C1 ** 2) * D ** 6 / 720)
+    lon = lon0 + (
+        D
+        - (1 + 2 * T1 + C1) * D ** 3 / 6
+        + (5 - 2 * C1 + 28 * T1 - 3 * C1 ** 2
+           + 8 * e2 / (1 - e2) + 24 * T1 ** 2) * D ** 5 / 120
+    ) / np.cos(lat1)
+    return float(np.degrees(lat)), float(np.degrees(lon))
+
+
+def _detect_block_format(region_line):
+    """Detect whether a resistivity-block region line is v4 or v5 format.
+
+    v4 (isotropic only): ``ireg rho rho_lo rho_hi n flag`` (col[1] float rho).
+    v5 (iso / TI / general anisotropy): ``ireg aniso_type ...`` (col[1] int 0/1/2).
+    Returns ``"v4"`` or ``"v5"``.
+    """
+    parts = region_line.split()
+    if len(parts) < 3:
+        return "v4"
+    try:
+        second = int(parts[1])
+    except ValueError:
+        return "v4"
+    if second not in (0, 1, 2):
+        return "v4"
+    try:
+        float(parts[2])
+        return "v5"
+    except ValueError:
+        return "v4"
+
+
+def _parse_region_line_v4(line):
+    """Parse one v4 region line: ``ireg rho rho_lower rho_upper n flag``."""
+    parts = line.split()
+    if len(parts) < 6:
+        raise ValueError(f"Invalid v4 region line (need >=6 columns): {line!r}")
+    ireg = int(parts[0])
+    rho = float(parts[1])
+    rho_lower = float(parts[2])
+    rho_upper = float(parts[3])
+    n = float(parts[4])
+    flag = int(parts[5])
+    return ireg, rho, rho_lower, rho_upper, n, flag
+
+
+def _parse_region_line_v5(line):
+    """Parse one v5 (anisotropic) region line into a dict of its fields.
+
+    Keys: ireg, aniso_type, rho_lo, rho_hi, flag, rhoXX, rhoYY, rhoZZ,
+    strike, dip, slant, fix_rhoXX, fix_rhoYY, fix_rhoZZ, fix_strike,
+    fix_dip, fix_slant.
+    """
+    parts = line.split()
+    if len(parts) < 2:
+        raise ValueError(f"Invalid v5 region line (too short): {line!r}")
+    ireg = int(parts[0])
+    aniso_type = int(parts[1])
+
+    result = dict(
+        ireg=ireg, aniso_type=aniso_type,
+        rhoXX=0.0, rhoYY=0.0, rhoZZ=0.0,
+        strike=0.0, dip=0.0, slant=0.0,
+        rho_lo=0.0, rho_hi=0.0, flag=0,
+        fix_rhoXX=0, fix_rhoYY=0, fix_rhoZZ=0,
+        fix_strike=0, fix_dip=0, fix_slant=0,
+    )
+
+    if aniso_type == _ANISO_ISO:
+        if len(parts) < 6:
+            raise ValueError(f"v5 ISO region line needs >=6 columns: {line!r}")
+        rho = float(parts[2])
+        result["rhoXX"] = rho
+        result["rhoYY"] = rho
+        result["rhoZZ"] = rho
+        result["rho_lo"] = float(parts[3])
+        result["rho_hi"] = float(parts[4])
+        result["flag"] = int(parts[5])
+
+    elif aniso_type == _ANISO_TI:
+        if len(parts) < 12:
+            raise ValueError(f"v5 TI region line needs >=12 columns: {line!r}")
+        result["rhoXX"] = float(parts[2])
+        result["rhoYY"] = float(parts[3])
+        result["rhoZZ"] = float(parts[2])   # TI: rhoZZ = rhoXX
+        result["strike"] = float(parts[4])
+        result["dip"] = float(parts[5])
+        result["slant"] = 0.0
+        result["rho_lo"] = float(parts[6])
+        result["rho_hi"] = float(parts[7])
+        result["fix_rhoXX"] = int(parts[8])
+        result["fix_rhoYY"] = int(parts[9])
+        result["fix_strike"] = int(parts[10])
+        result["fix_dip"] = int(parts[11])
+
+    elif aniso_type == _ANISO_GA:
+        if len(parts) < 16:
+            raise ValueError(f"v5 GA region line needs >=16 columns: {line!r}")
+        result["rhoXX"] = float(parts[2])
+        result["rhoYY"] = float(parts[3])
+        result["rhoZZ"] = float(parts[4])
+        result["strike"] = float(parts[5])
+        result["dip"] = float(parts[6])
+        result["slant"] = float(parts[7])
+        result["rho_lo"] = float(parts[8])
+        result["rho_hi"] = float(parts[9])
+        result["fix_rhoXX"] = int(parts[10])
+        result["fix_rhoYY"] = int(parts[11])
+        result["fix_rhoZZ"] = int(parts[12])
+        result["fix_strike"] = int(parts[13])
+        result["fix_dip"] = int(parts[14])
+        result["fix_slant"] = int(parts[15])
+    else:
+        raise ValueError(f"Unknown aniso_type {aniso_type} in v5 region line: {line!r}")
+
+    return result
+
+
+def _parse_region_line(line, fmt="v4"):
+    """Parse one region line, returning the v4-compatible 6-tuple
+    (ireg, rho, rho_lower, rho_upper, n, flag). For v5 lines, ``rho`` is
+    ``rhoXX``; full anisotropic parameters are in _parse_region_line_v5().
+    ``n`` is 1.0 for v5 lines (field not present in v5 format).
+    """
+    if fmt == "v5":
+        d = _parse_region_line_v5(line)
+        return d["ireg"], d["rhoXX"], d["rho_lo"], d["rho_hi"], 1.0, d["flag"]
+    return _parse_region_line_v4(line)
+
+
+def _infer_ocean_present(region1_line, fmt="v4"):
+    """Infer whether region 1 is an 'ocean' fixed block.
+
+    Heuristic (conservative): flag == 1 (fixed) and rho <= 1 Ohm.m (very
+    conductive, typical ocean ~0.25 Ohm.m). Override via read_model()'s
+    own ``ocean=True/False``.
+    """
+    _, rho, _, _, _, flag = _parse_region_line(region1_line, fmt=fmt)
+    return (flag == 1) and (rho <= 1.0)
+
+
+def read_model(model_file, model_trans="log10", out=True, *,
+               ocean=None, include_fixed=False):
+    """Read a FEMTIC resistivity_block_iterX.dat and return a model vector.
+
+    Default behaviour (include_fixed=False): always excludes region 0
+    (air), excludes any region with flag == 1, and additionally excludes
+    region 1 if it is treated as ocean (auto-inferred unless overridden
+    via ``ocean=...``).
+
+    Parameters
+    ----------
+    model_file : str or Path
+    model_trans : "log10" (default, returns log10(rho)) or "none"/"rho"
+    out : bool -- print a short info line if True
+    ocean : None (auto-infer) | True | False
+    include_fixed : bool -- if True, include every region
+
+    Returns
+    -------
+    np.ndarray -- 1-D vector of model parameters, region-index order
+    (selected regions only).
+    """
+    model_path = Path(model_file)
+
+    with model_path.open("r", encoding="utf-8", errors="replace") as f:
+        header = f.readline()
+        hdr_parts = header.split()
+        if len(hdr_parts) < 2:
+            raise ValueError(f"Invalid resistivity block header: {hdr_parts!r}")
+        nelem = int(hdr_parts[0])
+        nreg = int(hdr_parts[1])
+
+        for _ in range(nelem):
+            f.readline()
+
+        if nreg <= 0:
+            raise ValueError("No regions in resistivity block (nreg<=0).")
+
+        first_region_line = f.readline()
+        if not first_region_line:
+            raise ValueError("Unexpected EOF before first region line.")
+        fmt = _detect_block_format(first_region_line)
+
+        region_lines = []
+        region_rho = np.zeros(nreg, dtype=float)
+        region_flag = np.zeros(nreg, dtype=int)
+
+        all_region_lines = [first_region_line] + [f.readline() for _ in range(nreg - 1)]
+        for i, line in enumerate(all_region_lines):
+            if not line:
+                raise ValueError(
+                    f"Unexpected EOF while reading region lines: expected {nreg}, got {i}."
+                )
+            ireg, rho, _, _, _, flag = _parse_region_line(line, fmt=fmt)
+            if ireg != i:
+                raise ValueError(f"Expected region index {i} at line {i}, got {ireg}.")
+            region_lines.append(line)
+            region_rho[i] = rho
+            region_flag[i] = flag
+
+    ocean_present = False
+    if nreg > 1:
+        if ocean is None:
+            ocean_present = _infer_ocean_present(region_lines[1], fmt=fmt)
+        else:
+            ocean_present = bool(ocean)
+
+    fixed_mask = np.zeros(nreg, dtype=bool)
+    fixed_mask[0] = True  # air always fixed here
+    fixed_mask |= (region_flag == 1)
+    if nreg > 1 and ocean_present:
+        fixed_mask[1] = True
+
+    if include_fixed:
+        sel = np.arange(nreg, dtype=int)
+    else:
+        sel = np.where(~fixed_mask)[0]
+
+    rho_sel = region_rho[sel].astype(float, copy=False)
+
+    if model_trans.lower() == "log10":
+        out_vec = np.log10(rho_sel)
+    elif model_trans.lower() in ("none", "rho"):
+        out_vec = rho_sel
+    else:
+        raise ValueError(f"Unknown model_trans={model_trans!r}; use 'log10' or 'none'.")
+
+    if out:
+        n_fixed = int(fixed_mask.sum())
+        print(
+            f"read_model: file={model_path.name}, fmt={fmt}, nelem={nelem}, nreg={nreg}, "
+            f"ocean_present={ocean_present}, fixed={n_fixed}, returned={out_vec.size}."
+        )
+
+    return out_vec
+
+
+def read_femtic_mesh(mesh_path):
+    """Read a FEMTIC TETRA mesh file.
+
+    Returns
+    -------
+    nodes : ndarray, shape (nn, 3) -- node coordinates [x, y, z]
+    conn  : ndarray, shape (nelem, 4) -- tetrahedral connectivity (0-based)
+    """
+    with open(mesh_path, "r", errors="ignore") as f:
+        header = f.readline().strip()
+        if header.upper() != "TETRA":
+            raise ValueError(f"Unsupported mesh type '{header}', expected 'TETRA'.")
+
+        nn_line = f.readline().split()
+        if not nn_line:
+            raise ValueError("Missing node count after 'TETRA' header.")
+        nn = int(nn_line[0])
+
+        nodes = np.empty((nn, 3), dtype=float)
+        for _ in range(nn):
+            line = f.readline()
+            if not line:
+                raise ValueError("Unexpected EOF while reading node coordinates.")
+            parts = line.split()
+            if len(parts) < 4:
+                raise ValueError(f"Node line has too few columns: {line!r}")
+            idx = int(parts[0])
+            x, y, z = map(float, parts[1:4])
+            if not (0 <= idx < nn):
+                raise ValueError(f"Node index {idx} out of range 0..{nn-1}.")
+            nodes[idx] = (x, y, z)
+
+        nelem_line = f.readline().split()
+        if not nelem_line:
+            raise ValueError("Missing element count line after node block.")
+        nelem = int(nelem_line[0])
+
+        conn = np.empty((nelem, 4), dtype=int)
+        for _ in range(nelem):
+            line = f.readline()
+            if not line:
+                raise ValueError("Unexpected EOF while reading element block.")
+            parts = line.split()
+            if len(parts) < 9:
+                raise ValueError(f"Element line has too few columns: {line!r}")
+            ie = int(parts[0])
+            n1, n2, n3, n4 = map(int, parts[-4:])
+            if not (0 <= ie < nelem):
+                raise ValueError(f"Element index {ie} out of range 0..{nelem-1}.")
+            conn[ie] = (n1, n2, n3, n4)
+
+    return nodes, conn
+
+
+def read_resistivity_block(block_path):
+    """Read a FEMTIC resistivity_block_iterX.dat and return region-based data.
+
+    Returns a dict with keys: nelem, nreg, fmt, region_of_elem, region_rho,
+    region_rho_lower, region_rho_upper, region_n, region_flag, and (v5
+    only) region_aniso_type, region_rhoYY, region_rhoZZ, region_strike,
+    region_dip, region_slant.
+    """
+    with open(block_path, "r", errors="ignore") as f:
+        first = f.readline().split()
+        if len(first) < 2:
+            raise ValueError("First line must contain 'nelem nreg'.")
+        nelem = int(first[0])
+        nreg = int(first[1])
+
+        region_of_elem = np.empty(nelem, dtype=int)
+        for _ in range(nelem):
+            line = f.readline()
+            if not line:
+                raise ValueError("Unexpected EOF while reading element-region map.")
+            parts = line.split()
+            if len(parts) < 2:
+                raise ValueError(f"Element-region line has too few columns: {line!r}")
+            ie = int(parts[0])
+            ireg = int(parts[1])
+            if not (0 <= ie < nelem):
+                raise ValueError(f"Element index {ie} out of range 0..{nelem-1}.")
+            region_of_elem[ie] = ireg
+
+        region_rho = np.empty(nreg, dtype=float)
+        region_rho_lower = np.empty(nreg, dtype=float)
+        region_rho_upper = np.empty(nreg, dtype=float)
+        region_n = np.empty(nreg, dtype=float)
+        region_flag = np.empty(nreg, dtype=int)
+        region_aniso_type = np.zeros(nreg, dtype=int)
+        region_rhoYY = np.empty(nreg, dtype=float)
+        region_rhoZZ = np.empty(nreg, dtype=float)
+        region_strike = np.zeros(nreg, dtype=float)
+        region_dip = np.zeros(nreg, dtype=float)
+        region_slant = np.zeros(nreg, dtype=float)
+
+        first_region_line = f.readline()
+        if not first_region_line:
+            raise ValueError("Unexpected EOF before first region line (read_resistivity_block).")
+        fmt = _detect_block_format(first_region_line)
+        all_rlines = [first_region_line] + [f.readline() for _ in range(nreg - 1)]
+
+        for line in all_rlines:
+            if not line:
+                raise ValueError("Unexpected EOF while reading region lines.")
+            ireg, rho, rho_min, rho_max, n, flag = _parse_region_line(line, fmt=fmt)
+            if not (0 <= ireg < nreg):
+                raise ValueError(f"Region index {ireg} out of range 0..{nreg-1}.")
+            region_rho[ireg] = rho
+            region_rho_lower[ireg] = rho_min
+            region_rho_upper[ireg] = rho_max
+            region_n[ireg] = n
+            region_flag[ireg] = flag
+            if fmt == "v5":
+                d = _parse_region_line_v5(line)
+                region_aniso_type[ireg] = d["aniso_type"]
+                region_rhoYY[ireg] = d["rhoYY"]
+                region_rhoZZ[ireg] = d["rhoZZ"]
+                region_strike[ireg] = d["strike"]
+                region_dip[ireg] = d["dip"]
+                region_slant[ireg] = d["slant"]
+            else:
+                region_rhoYY[ireg] = rho
+                region_rhoZZ[ireg] = rho
+
+    result = {
+        "nelem": np.array(nelem, dtype=int),
+        "nreg": np.array(nreg, dtype=int),
+        "fmt": fmt,
+        "region_of_elem": region_of_elem,
+        "region_rho": region_rho,
+        "region_rho_lower": region_rho_lower,
+        "region_rho_upper": region_rho_upper,
+        "region_n": region_n,
+        "region_flag": region_flag,
+    }
+    if fmt == "v5":
+        result.update({
+            "region_aniso_type": region_aniso_type,
+            "region_rhoYY": region_rhoYY,
+            "region_rhoZZ": region_rhoZZ,
+            "region_strike": region_strike,
+            "region_dip": region_dip,
+            "region_slant": region_slant,
+        })
+    return result
+
+
+def build_element_arrays(nodes, conn, region_of_elem, region_rho,
+                          region_rho_lower, region_rho_upper, region_n,
+                          region_flag, clip_eps=1.0e-30):
+    """Build per-element arrays (centroids, log10 resistivity, bounds,
+    flags, n) from a FEMTIC mesh + read_resistivity_block() output.
+
+    Returns a dict with keys: centroid, region, log10_resistivity,
+    rho_lower, rho_upper, flag, n.
+    """
+    nodes = np.asarray(nodes, dtype=float)
+    conn = np.asarray(conn, dtype=int)
+    region_of_elem = np.asarray(region_of_elem, dtype=int)
+
+    nelem = conn.shape[0]
+    if region_of_elem.shape[0] != nelem:
+        raise ValueError("region_of_elem length does not match number of elements.")
+
+    coords = nodes[conn]
+    centroid = coords.mean(axis=1)
+
+    rho = np.clip(region_rho, clip_eps, np.inf)
+    rho_min = np.clip(region_rho_lower, clip_eps, np.inf)
+    rho_max = np.clip(region_rho_upper, clip_eps, np.inf)
+
+    rid = region_of_elem
+    rho_elem = rho[rid]
+    rho_min_elem = rho_min[rid]
+    rho_max_elem = rho_max[rid]
+    n_elem = region_n[rid]
+    flag_elem = region_flag[rid]
+
+    log10_rho = np.log10(rho_elem)
+    log10_rho_min = np.log10(rho_min_elem)
+    log10_rho_max = np.log10(rho_max_elem)
+
+    return {
+        "centroid": centroid,
+        "region": rid,
+        "log10_resistivity": log10_rho,
+        "rho_lower": log10_rho_min,
+        "rho_upper": log10_rho_max,
+        "flag": flag_elem,
+        "n": n_elem,
+    }
+
+
+def read_site_position(observe_file, site_number):
+    """Return (x_m, y_m) model-local position for site_number from observe.dat.
+
+    Scans linearly for site-header lines matching ``int int float float``
+    and returns the (x, y) pair (converted from km) that matches
+    site_number (1-based).
+    """
+    if not os.path.isfile(observe_file):
+        raise FileNotFoundError(f"observe.dat not found: {observe_file}")
+
+    with open(observe_file) as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            try:
+                n1 = int(parts[0])
+                int(parts[1])
+                x_km = float(parts[2])
+                y_km = float(parts[3])
+            except ValueError:
+                continue
+            if n1 == site_number:
+                return x_km * 1000.0, y_km * 1000.0
+
+    raise ValueError(f"Site {site_number} not found in {observe_file}.  Check SITE_NUMBER.")
+
+
+def read_site_dat(path, site_names=None):
+    """Read site positions from a FEMTIC sitelist CSV (mt_make_sitelist.py).
+
+    Format (comma-separated, no header; ``#``-prefixed lines ignored):
+    name, lat, lon, elev, sitenum, easting, northing (easting/northing in
+    UTM metres, lat/lon in decimal degrees).
+
+    Returns a list of dicts with keys name, lat, lon, elev, sitenum,
+    easting, northing. ``site_names`` (str or list[str], optional)
+    restricts to matching rows.
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"site.dat not found: {path}")
+
+    if site_names is not None:
+        if isinstance(site_names, str):
+            site_names = [site_names]
+        site_names = set(site_names)
+
+    sites = []
+    with open(path) as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.split("#")[0].strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 7:
+                raise ValueError(
+                    f"{path}:{lineno}: expected 7 columns "
+                    f"(name,lat,lon,elev,sitenum,easting,northing), "
+                    f"got {len(parts)}: {raw.rstrip()}"
+                )
+            try:
+                name = parts[0]
+                lat = float(parts[1])
+                lon = float(parts[2])
+                elev = float(parts[3])
+                sitenum = int(parts[4])
+                easting = float(parts[5])
+                northing = float(parts[6])
+            except ValueError as exc:
+                raise ValueError(f"{path}:{lineno}: cannot parse values: {exc}") from exc
+            if site_names is not None and name not in site_names:
+                continue
+            sites.append(dict(
+                name=name, lat=lat, lon=lon, elev=elev,
+                sitenum=sitenum, easting=easting, northing=northing,
+            ))
+    return sites
+
+
+def estimate_utm_origin(calibration_sites, observe_file, zone, northern, *,
+                         site_dat=None, out=True):
+    """Estimate UTM coordinates of the FEMTIC mesh centre.
+
+    Two methods, selected automatically:
+
+    Bounding-box centre (default when calibration_sites is empty): reads
+    all site UTM coordinates from site_dat (mt_make_sitelist.py's sitelist)
+    and sets the origin to the midpoint of the bounding box.
+
+    Calibration-site pairs (used when calibration_sites is non-empty):
+    each entry gives a site whose model-local position (from observe_file,
+    or inline x_km/y_km) and geographic position are both known; with N
+    sites the origin is the mean of the N implied offsets.
+
+    Parameters
+    ----------
+    calibration_sites : list of dict, each with "site" (int), "crs"
+        ("latlon" or "utm"), "coords" ([lon, lat] or [E_m, N_m]). May be
+        empty -- triggers the bounding-box fallback.
+    observe_file : str -- path to observe.dat (calibration-site method)
+    zone : int -- UTM zone number
+    northern : bool -- hemisphere flag
+    site_dat : str or None -- FEMTIC sitelist CSV (bounding-box method)
+    out : bool -- print per-site details and result if True
+
+    Returns
+    -------
+    origin_E, origin_N : float -- estimated UTM coordinates of the mesh
+    centre [m].
+    """
+    if not calibration_sites:
+        if site_dat is None:
+            raise ValueError(
+                "estimate_utm_origin: calibration_sites is empty and "
+                "site_dat is None -- cannot estimate origin."
+            )
+        rows = read_site_dat(site_dat)
+        if not rows:
+            raise ValueError(f"estimate_utm_origin: site_dat {site_dat!r} is empty.")
+        eastings = np.array([r["easting"] for r in rows])
+        northings = np.array([r["northing"] for r in rows])
+        origin_E = float((eastings.min() + eastings.max()) / 2.0)
+        origin_N = float((northings.min() + northings.max()) / 2.0)
+        if out:
+            center_lat, center_lon = utm_to_latlon_zn(origin_E, origin_N, zone, northern)
+            print("Estimating mesh-centre UTM origin from sitelist bounding box:")
+            print(f"  sites          : {len(rows)}")
+            print(f"  E range        : {eastings.min():.1f} - {eastings.max():.1f} m")
+            print(f"  N range        : {northings.min():.1f} - {northings.max():.1f} m")
+            print(f"  UTM_ORIGIN_E   = {origin_E:.1f}")
+            print(f"  UTM_ORIGIN_N   = {origin_N:.1f}")
+            print(f"  UTM_ORIGIN_LAT = {center_lat:.6f}")
+            print(f"  UTM_ORIGIN_LON = {center_lon:.6f}")
+            print("  Copy these values into the Configuration block.")
+            print()
+        return origin_E, origin_N
+
+    offsets_E = []
+    offsets_N = []
+
+    if out:
+        print("Estimating mesh-centre UTM origin from calibration sites:")
+        print(f"  {'site':>5}  {'x_model':>10}  {'y_model':>10}  "
+              f"{'E_utm':>12}  {'N_utm':>14}  {'dE':>8}  {'dN':>8}")
+        print("  " + "-" * 77)
+
+    for entry in calibration_sites:
+        site_num = int(entry["site"])
+        crs = str(entry["crs"])
+        coords = list(entry["coords"])
+
+        if "x_km" in entry and "y_km" in entry:
+            x_m = float(entry["x_km"]) * 1e3
+            y_m = float(entry["y_km"]) * 1e3
+        else:
+            x_m, y_m = read_site_position(observe_file, site_num)
+
+        if crs == "latlon":
+            lon_deg, lat_deg = coords
+            E_site, N_site = latlon_to_utm_zn(lat_deg, lon_deg, zone, northern)
+        elif crs == "utm":
+            E_site, N_site = float(coords[0]), float(coords[1])
+        else:
+            raise ValueError(f"Calibration site {site_num}: unknown crs={crs!r}. Use 'latlon' or 'utm'.")
+
+        oE = E_site - x_m
+        oN = N_site - y_m
+        offsets_E.append(oE)
+        offsets_N.append(oN)
+
+        if out:
+            print(f"  {site_num:>5}  {x_m/1000:>10.3f}  {y_m/1000:>10.3f}  "
+                  f"{E_site:>12.1f}  {N_site:>14.1f}  {oE:>8.1f}  {oN:>8.1f}")
+
+    origin_E = float(np.mean(offsets_E))
+    origin_N = float(np.mean(offsets_N))
+
+    if out and len(calibration_sites) > 1:
+        print()
+        print(f"  {'site':>5}  {'res_E (m)':>10}  {'res_N (m)':>10}")
+        print("  " + "-" * 30)
+        for entry, oE, oN in zip(calibration_sites, offsets_E, offsets_N):
+            print(f"  {int(entry['site']):>5}  {oE - origin_E:>10.2f}  {oN - origin_N:>10.2f}")
+        rms_E = float(np.sqrt(np.mean((np.array(offsets_E) - origin_E) ** 2)))
+        rms_N = float(np.sqrt(np.mean((np.array(offsets_N) - origin_N) ** 2)))
+        print(f"  {'RMS':>5}  {rms_E:>10.2f}  {rms_N:>10.2f}")
+
+    print()
+    print("  Estimated mesh-centre UTM origin:")
+    print(f"    UTM_ORIGIN_E = {origin_E:.1f}")
+    print(f"    UTM_ORIGIN_N = {origin_N:.1f}")
+    print("  Copy these values into the Configuration block.")
+    print()
+
+    return origin_E, origin_N
+
+
+# =====================================================================
+# SECTION: ModEM I/O (consolidated from modem.py)
+# =====================================================================
+# Only the three readers this pipeline's precompute.py actually uses.
+# Not a port of modem.py (5700+ lines: Jacobian I/O, model writers,
+# UBC/RLM format conversion, NetCDF export, denoising/regularisation
+# utilities needing numba/pywt). Left out deliberately -- none of these
+# are called by any consumer script today; add on demand rather than
+# speculatively:
+#   - read_data_jac, write_data, read_mod_aniso, and every write_*/
+#     convert_* routine
+#   - anything gated on numba (@jit) or pywt in the original module --
+#     neither read_mod, read_data, nor get_topo touch either.
+
+
+def read_mod(file=None, modext=".rho", trans="LINEAR", blank=1.e-30, out=True):
+    """Read a ModEM model input file. Returns mval in physical units by
+    default (trans="LINEAR"); pass trans="LOG10"/"LOGE" to get back
+    log-transformed values instead.
+
+    Returns
+    -------
+    dx, dy, dz : ndarray -- cell sizes along each axis
+    mval : ndarray, shape (nx, ny, nz) -- model values
+    reference : list[float] -- [x0, y0, z0] reference coordinates
+    trans : str -- echoes the requested output transform
+    """
+    modf = file + modext
+
+    with open(modf, "r") as f:
+        lines = f.readlines()
+
+    lines = [line.split() for line in lines]
+    dims = [int(sub) for sub in lines[1][0:3]]
+    nx, ny, nz = dims
+    trns = lines[1][4]
+    dx = np.array([float(sub) for sub in lines[2]])
+    dy = np.array([float(sub) for sub in lines[3]])
+    dz = np.array([float(sub) for sub in lines[4]])
+
+    mval = np.array([])
+    for line in lines[5:-2]:
+        line = np.flipud(line)
+        mval = np.append(mval, np.array([float(sub) for sub in line]))
+
+    if out:
+        print("values in " + file + " are: " + trns)
+
+    if trns == "LOGE":
+        mval = np.exp(mval)
+    elif trns == "LOG10":
+        mval = np.power(10.0, mval)
+    elif trns == "LINEAR":
+        pass
+    else:
+        raise ValueError(f"Transformation: {trns} not defined!")
+
+    # here mval should be in physical units, not log...
+    mval[np.where(np.abs(mval) < blank)] = blank
+
+    if "loge" in trans.lower() or "ln" in trans.lower():
+        mval = np.log(mval)
+        if out:
+            print("values transformed to: " + trans)
+    elif "log10" in trans.lower():
+        mval = np.log10(mval)
+        if out:
+            print("values transformed to: " + trans)
+    else:
+        if out:
+            print("values transformed to: " + trans)
+
+    mval = mval.reshape(dims, order="F")
+
+    reference = [float(sub) for sub in lines[-2][0:3]]
+
+    if out:
+        print("read_model: %i x %i x %i model read from %s" % (nx, ny, nz, file))
+
+    return dx, dy, dz, mval, reference, trans
+
+
+def read_data(Datfile=None, modext=".dat", out=True):
+    """Read a ModEM input data file.
+
+    Returns
+    -------
+    Site : ndarray[object] -- site name per data row
+    Comp : ndarray[object] -- component code per data row
+    Data : ndarray -- data columns (period, geo/model coords, value, error, ...)
+    Head : list[str] -- raw header/block-header lines (# and > prefixed)
+    """
+    file = Datfile + modext
+
+    Data = []
+    Site = []
+    Comp = []
+    Head = []
+
+    with open(file) as fd:
+        for line in fd:
+            if line.startswith("#") or line.startswith(">"):
+                Head.append(line)
+                continue
+
+            t = line.split()
+
+            if "PT" in t[7] or "RH" in t[7] or "PH" in t[7]:
+                tmp = [
+                    float(t[0]), float(t[2]), float(t[3]), float(t[4]),
+                    float(t[5]), float(t[6]), float(t[8]),
+                    float(t[9]), 0.,
+                ]
+                Data.append(tmp)
+                Site.append([t[1]])
+                Comp.append([t[7]])
+            else:
+                tmp = [
+                    float(t[0]), float(t[2]), float(t[3]), float(t[4]),
+                    float(t[5]), float(t[6]), float(t[8]),
+                    float(t[9]), float(t[10]),
+                ]
+                Data.append(tmp)
+                Comp.append([t[7]])
+                Site.append([t[1]])
+
+    Site = [item for sublist in Site for item in sublist]
+    Site = np.asarray(Site, dtype=object)
+    Comp = [item for sublist in Comp for item in sublist]
+    Comp = np.asarray(Comp, dtype=object)
+    Data = np.asarray(Data)
+
+    nD = np.shape(Data)
+    if out:
+        print("readDat: %i data read from %s" % (nD[0], file))
+
+    return Site, Comp, Data, Head
+
+
+def get_topo(dx=None, dy=None, dz=None, mval=None, ref=[0., 0., 0.],
+             mvalair=1.e17, out=True):
+    """Extract topography (surface elevation) from a ModEM model.
+
+    Parameters
+    ----------
+    dx, dy, dz : ndarray -- mesh cell sizes
+    mval : ndarray, shape (nx, ny, nz) -- cell resistivities (physical units)
+    ref : sequence[float] -- reference coordinates, default [0, 0, 0]
+    mvalair : float -- resistivity value marking air cells (physical units)
+    out : bool -- print a short info line if True
+
+    Returns
+    -------
+    xcnt, ycnt : ndarray -- cell-centre coordinates in the x/y plane
+    topo : ndarray, shape (nx, ny) -- elevation of the topmost non-air cell
+    """
+    nx, ny, nz = np.shape(mval)
+
+    x = np.append(0.0, np.cumsum(dx))
+    xcnt = 0.5 * (x[0:nx] + x[1:nx + 1]) + ref[0]
+
+    y = np.append(0.0, np.cumsum(dy))
+    ycnt = 0.5 * (y[0:ny] + y[1:ny + 1]) + ref[1]
+
+    ztop = np.append(0.0, np.cumsum(dz)) + ref[2]
+
+    topo = np.zeros((nx, ny))
+    for ii in np.arange(nx):
+        for jj in np.arange(ny):
+            col = mval[ii, jj, :]
+            nsurf = np.argmax(col < mvalair)
+            topo[ii, jj] = ztop[nsurf]
+
+    if out:
+        print("get topo: %i x %i cell surfaces marked" % (nx, ny))
+
+    return xcnt, ycnt, topo

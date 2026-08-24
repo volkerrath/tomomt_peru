@@ -47,13 +47,14 @@ Three kinds of native source (VARIABLE_SOURCES below)
     lon, y/x, ...) — never assumed/hard-coded, always read from the
     file itself.
   "femtic_points" — a FEMTIC tetrahedral mesh (mesh.dat) + resistivity
-    block (resistivity_block_iterX.dat), read directly via femtic.py
-    (no precompute.py step of its own — FEMTIC's own output files are
-    the native source). Each element's centroid + log10(resistivity)
-    becomes one point, in the same (easting_km, northing_km, depth_km)
-    convention as the other two kinds, via load_femtic_points() below.
-    Air/ocean/explicitly-fixed regions are excluded by default, mirroring
-    femtic.read_model()'s own semantics. Requires an explicit UTM origin
+    block (resistivity_block_iterX.dat), read directly via tomomt.py's
+    consolidated FEMTIC-reader functions (no precompute.py step of its
+    own — FEMTIC's own output files are the native source). Each
+    element's centroid + log10(resistivity) becomes one point, in the
+    same (easting_km, northing_km, depth_km) convention as the other two
+    kinds, via load_femtic_points() below. Air/ocean/explicitly-fixed
+    regions are excluded by default, mirroring tomomt.read_model()'s own
+    semantics. Requires an explicit UTM origin
     (femtic_origin_e_m/femtic_origin_n_m in the VARIABLE_SOURCES entry)
     — there is no safe default to guess here (see load_femtic_points()'s
     docstring). Since this is just another native source feeding the
@@ -199,19 +200,20 @@ NC_DIR = "../precompute/saba/"   # must match OUTPUT_DIR in precompute.py;
 # precompute.py step of their own.
 FEMTIC_DIR = "../femtic/"
 
-# UTM METRES of the FEMTIC mesh's own local-coordinate origin (femtic.py's
-# utm_to_model() convention: model-local x/y = UTM easting/northing minus
-# this origin, axes aligned with UTM east/north, no rotation). REQUIRED
-# if any VARIABLE_SOURCES entry uses kind="femtic_points" — there is no
-# safe default to guess here (unlike e.g. GRID_*_KM's auto-bounds, this
-# is essential geo-referencing metadata, not something with a sensible
-# "auto" fallback). Get it from the FEMTIC run's own setup, or from
-# femtic.estimate_utm_origin() against known calibration site positions.
+# UTM METRES of the FEMTIC mesh's own local-coordinate origin (FEMTIC's
+# own utm_to_model() convention: model-local x/y = UTM easting/northing
+# minus this origin, axes aligned with UTM east/north, no rotation).
+# REQUIRED if any VARIABLE_SOURCES entry uses kind="femtic_points" —
+# there is no safe default to guess here (unlike e.g. GRID_*_KM's
+# auto-bounds, this is essential geo-referencing metadata, not something
+# with a sensible "auto" fallback). Get it from the FEMTIC run's own
+# setup, or from tomomt.estimate_utm_origin() against known calibration
+# site positions.
 FEMTIC_ORIGIN_E_M = None
 FEMTIC_ORIGIN_N_M = None
 
 # Depth-axis calibration (km), added to FEMTIC's own z/1000 (z positive
-# downward, metres — femtic.py's documented convention, already matching
+# downward, metres — FEMTIC's own documented convention, already matching
 # this pipeline's depth-positive-down convention) — only needed if the
 # FEMTIC mesh's own z=0 datum isn't exactly this project's z=0 reference
 # (precompute.py's build_depth_axis_km() ref_z, for the ModEM side).
@@ -220,12 +222,12 @@ FEMTIC_ORIGIN_N_M = None
 FEMTIC_DEPTH_OFFSET_KM = 0.0
 
 # Which regions to exclude before building the point cloud — mirrors
-# femtic.read_model()'s own parameters/semantics exactly (air region 0
+# tomomt.read_model()'s own parameters/semantics exactly (air region 0
 # and any flag==1 region always excluded; region 1 additionally excluded
 # if ocean-present). include_fixed=True keeps every element (air/ocean/
 # fixed included) instead.
 FEMTIC_INCLUDE_FIXED = False
-FEMTIC_OCEAN = None   # None = auto-infer (femtic._infer_ocean_present);
+FEMTIC_OCEAN = None   # None = auto-infer (tomomt._infer_ocean_present);
                        # True/False = force ocean-present/-absent
 
 # --- Variable registry ---
@@ -535,9 +537,9 @@ def load_seis_grid_points(file, var):
 
 def _femtic_ocean_present(block_path, block, ocean_override):
     """
-    Determine ocean-present the same way femtic.read_model() does: an
+    Determine ocean-present the same way tomomt.read_model() does: an
     explicit `ocean_override` wins outright; otherwise auto-infer via
-    femtic._infer_ocean_present() on region 1's own raw line. Re-reads
+    tomomt._infer_ocean_present() on region 1's own raw line. Re-reads
     just the block file's region-lines section (cheap relative to the
     element-region mapping section read_resistivity_block() already
     parsed once) rather than re-implementing the heuristic itself.
@@ -547,7 +549,6 @@ def _femtic_ocean_present(block_path, block, ocean_override):
     nreg = int(block["nreg"])
     if nreg <= 1:
         return False
-    import femtic  # lazy import — only needed for femtic_points sources
     nelem = int(block["nelem"])
     with open(block_path, "r", errors="ignore") as f:
         f.readline()               # "nelem nreg" header
@@ -555,7 +556,7 @@ def _femtic_ocean_present(block_path, block, ocean_override):
             f.readline()            # element -> region mapping
         f.readline()                # region 0 (air)
         region1_line = f.readline()
-    return femtic._infer_ocean_present(region1_line, fmt=block["fmt"])
+    return tomomt._infer_ocean_present(region1_line, fmt=block["fmt"])
 
 
 def load_femtic_points(mesh_file, block_file, origin_e_m, origin_n_m,
@@ -568,22 +569,22 @@ def load_femtic_points(mesh_file, block_file, origin_e_m, origin_n_m,
 
     FEMTIC's mesh.dat stores node coordinates in MODEL-LOCAL METRES: x/y
     are UTM easting/northing offset by the mesh's own local origin (axes
-    aligned with UTM east/north, no rotation — femtic.py's own
-    utm_to_model()); z is positive DOWNWARD in metres (femtic.py's
+    aligned with UTM east/north, no rotation — FEMTIC's own
+    utm_to_model()); z is positive DOWNWARD in metres (FEMTIC's
     documented z-convention, already matching this pipeline's own
     depth-positive-down convention, so no sign flip is needed here —
     only the unit conversion to km and, if calibrated, depth_offset_km).
     origin_e_m/origin_n_m (UTM METRES) are therefore REQUIRED: there is
     no safe "auto" origin to fall back to. Get them from the FEMTIC run's
-    own setup, or from femtic.estimate_utm_origin() against known
+    own setup, or from tomomt.estimate_utm_origin() against known
     calibration site positions.
 
-    include_fixed/ocean mirror femtic.read_model()'s own parameters and
+    include_fixed/ocean mirror tomomt.read_model()'s own parameters and
     semantics exactly (air region 0 and any flag==1 region always
     excluded; region 1 additionally excluded if ocean-present, auto-
     inferred unless `ocean` is given explicitly) — applied here per
     ELEMENT via region_of_elem, since this function needs one point per
-    mesh element, not femtic.read_model()'s one value per region.
+    mesh element, not tomomt.read_model()'s one value per region.
 
     Returns
     -------
@@ -594,18 +595,6 @@ def load_femtic_points(mesh_file, block_file, origin_e_m, origin_n_m,
     resistivity are directly comparable once both are interpolated onto
     the same target grid.
     """
-    try:
-        import femtic
-    except ImportError as exc:
-        raise ImportError(
-            "load_femtic_points() needs femtic.py -- and, in turn, "
-            "ensembles.py, which femtic.py imports unconditionally at "
-            "module level for its roughness/prior-covariance tools even "
-            "though this function doesn't use them -- importable on "
-            "sys.path. Only required if a VARIABLE_SOURCES entry "
-            "actually uses kind='femtic_points'."
-        ) from exc
-
     if origin_e_m is None or origin_n_m is None:
         raise ValueError(
             "load_femtic_points() requires origin_e_m/origin_n_m (the "
@@ -613,15 +602,15 @@ def load_femtic_points(mesh_file, block_file, origin_e_m, origin_n_m,
             "-- there's no safe default to guess here. Set "
             "FEMTIC_ORIGIN_E_M/FEMTIC_ORIGIN_N_M (or this entry's own "
             "origin_e_m/origin_n_m), from the FEMTIC run's own setup or "
-            "femtic.estimate_utm_origin()."
+            "tomomt.estimate_utm_origin()."
         )
 
     mesh_path = fempath(mesh_file)
     block_path = fempath(block_file)
 
-    nodes, conn = femtic.read_femtic_mesh(mesh_path)
-    block = femtic.read_resistivity_block(block_path)
-    arrays = femtic.build_element_arrays(
+    nodes, conn = tomomt.read_femtic_mesh(mesh_path)
+    block = tomomt.read_resistivity_block(block_path)
+    arrays = tomomt.build_element_arrays(
         nodes=nodes, conn=conn,
         region_of_elem=block["region_of_elem"],
         region_rho=block["region_rho"],
