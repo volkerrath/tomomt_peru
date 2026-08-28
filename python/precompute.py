@@ -8,7 +8,7 @@ Combined pre-computation script for the imaging pipeline.
 Site-specific settings (input files, region box, depth lists, etc.) are
 kept as capitalized constants below; where they differ between sites, the
 currently-active value is live and any other site's value is kept as a
-labeled, commented-out alternative (e.g. "# TACNA") right next to it, so
+labeled, commented-out alternative (e.g. "# ubinas") right next to it, so
 switching sites is a matter of swapping which line is commented.
 
 This merges what were previously two separate scripts:
@@ -17,13 +17,21 @@ This merges what were previously two separate scripts:
   * precompute_seis.py   (Part B below) — seismic tomography
     Vp / Vs / Vp-Vs-ratio, topography/bathymetry, and (new) density.
 
-Both parts read their own model files, reproject/crop/slice them onto UTM
+A third part (Part C, 2026-08) reads a FEMTIC tetrahedral mesh +
+resistivity block the same way -- once, here -- instead of
+interpolate.py and plot_femtic_mesh.py each re-reading and re-deriving
+from the raw mesh.dat/resistivity_block_iterX.dat files on every run.
+This follows the same "air-cell-masking/origin-math happens upstream,
+once" convention already used by Part A's modem_submesh_points.nc.
+
+All three parts read their own model files, reproject/crop/slice them onto UTM
 (Zone 19S, EPSG:32719) grids in km, and write NetCDF files consumed by the
 companion plot scripts (plot_modem_image.py, plot_modem_mesh.py,
-plot_seis.py). They are combined into one script because they share
-region-of-interest settings (TAR_LON/TAR_LAT/CROP_TO_REGION — see SHARED
-SETTINGS below) and because a density model, added here, sits alongside the
-seismic Vp/Vs tomography and is processed exactly the same way.
+plot_seis.py, plot_femtic_mesh.py) and interpolate.py. They are combined
+into one script because they share region-of-interest settings
+(TAR_LON/TAR_LAT/CROP_TO_REGION — see SHARED SETTINGS below) and because a
+density model, added here, sits alongside the seismic Vp/Vs tomography and
+is processed exactly the same way.
 
 What this script produces
 --------------------------
@@ -49,6 +57,14 @@ Part B (seismic tomography + density, seismic grid):
   {SITE_PREFIX}_vs_utm_{tag}.nc  }
   {SITE_PREFIX}_vps_utm_{tag}.nc }    — per-depth UTM-km slices
   {SITE_PREFIX}_dens_utm_{tag}.nc}    — per-depth UTM-km density slice
+
+Part C (FEMTIC, native tetrahedral mesh):
+  femtic_mesh_utm.nc          — full node/connectivity topology, UTM metres
+                                (origin + depth offset already applied), for
+                                plot_femtic_mesh.py's plane-intersection slicing
+  femtic_submesh_points.nc   — flat one-row-per-element point table, UTM km
+                                (same schema/NaN convention as
+                                modem_submesh_points.nc), for interpolate.py
 
 Density (Part B) — renamed "dens", not "rho"
 ------------------------------------------------
@@ -135,6 +151,7 @@ License: GNU General Public License v3 (GPL-3.0-or-later).
 AI-generated code — review before use in production.
 """
 
+import os
 import sys
 import subprocess
 import tempfile
@@ -155,17 +172,17 @@ import tomomt
 # Prefixes every Part-B seismic/density output filename
 # ({SITE_PREFIX}_vp.nc, {SITE_PREFIX}_topo_utm.nc, etc. — see module
 # docstring). Change this (and the site-specific settings marked with a
-# "# TACNA" comment throughout this file) to switch which site's inputs
+# "# ubinas" comment throughout this file) to switch which site's inputs
 # and outputs are active.
 # SITE_PREFIX = "saba"
-SITE_PREFIX = "tacna"  # TACNA
+SITE_PREFIX = "ubinas"  # ubinas
 
 # Directory for all NetCDF outputs written by this script (created if it
 # doesn't exist). Default "." keeps everything in the current directory.
 # plot_modem_image.py / plot_modem_mesh.py / plot_seis.py have a matching
 # NC_DIR setting to read from wherever this is pointed at.
 # OUTPUT_DIR = "."
-OUTPUT_DIR = "../precompute/tacna/"
+OUTPUT_DIR = "../precompute/ubinas_small/"
 
 # --- Geographic region of interest ---
 # TRIM_PAD (Part A) only drops a fixed number of cells and typically still
@@ -188,8 +205,14 @@ OUTPUT_DIR = "../precompute/tacna/"
 # [-18.34, -17.01], padded by ~0.05° — now shared by both parts of the
 # script so they always cover the same geographic area by construction.
 CROP_TO_REGION = True
-TAR_LON = [-70.84, -69.35]  # TACNA
-TAR_LAT = [-18.40, -16.90]  # TACNA
+#TAR_LON =  [-71.3975, -70.3975] # ubinas
+#TAR_LAT = [-16.8452, -15.84519999] # ubinas
+
+TAR_LON =  [-71.07, -70.71] # ubinas small
+TAR_LAT = [-16.51, -16.20] # ubinas small
+
+#TAR_LON = [-70.84, -69.35]  # tacna
+#TAR_LAT = [-18.40, -16.90]  # tac
 #TAR_LON = [-72.62, -71.271]
 #TAR_LAT = [-16.62, -15.109]  # passing by Sabancaya
 
@@ -210,8 +233,8 @@ safe_to_netcdf = tomomt.safe_to_netcdf
 # =====================================================================
 
 # --- Input files (without extension) ---
-MODEL_FILE = "../mt/tacna/TACG26b_Z1_NLCG_006_clip"  # TACNA
-DATA_FILE = "../mt/tacna/TAC_100_smooth2_short/TACG26b_100ZT_Alpha03_smooth_NLCG_007"  # TACNA
+MODEL_FILE = "../mt/ubinas/UBI8_P16_Alpha02_NLCG_020"  # ubinas
+DATA_FILE = "../mt/ubinas/UBI8_P16_Alpha02_NLCG_020"  # ubinas
 #MODEL_FILE = "../mt/saba/SABA13_Z_Alpha01_priorP8_NLCG_016_clip"  # reads MODEL_FILE + MODEL_EXT
 #DATA_FILE = "../mt/saba/SABA13a_Z"  # reads DATA_FILE  + DATA_EXT
 MODEL_EXT = ".rho"
@@ -224,8 +247,8 @@ DATA_EXT = ".dat"
 # Set USE_SENSITIVITY = False to skip reading/writing it entirely.
 USE_SENSITIVITY = False
 # SENS_FILE = MODEL_FILE      # base name (without extension)
-# SENS_FILE = "../mt/TAC30_nerr_sp-8_anco_cov_max"  # TACNA
-SENS_FILE = ("../mt/tacna/TAC_G2_ZT1_nerr_sp-8_Dtype_zfull_sqr_max.sns")  # TACNA
+# SENS_FILE = "../mt/TAC30_nerr_sp-8_anco_cov_max"  # ubinas
+SENS_FILE = ("../mt/ubinas/XXX.sns")  # ubinas
 #SENS_FILE = (
     #"../mt/saba/SABA13a_total_sns"
 #)
@@ -257,6 +280,8 @@ SENS_FLIP_NORTHING = False  # empirically confirmed against real station
 REFERENCE_LAT = None  # degrees, WGS84; None → read from model file
 REFERENCE_LON = None  # degrees, WGS84; None → read from model file
 
+
+
 # --- Resistivity transform for output ---
 # "LOG10"  : save log10(ρ)  [most common for visualisation]
 # "LOGE"   : save ln(ρ)
@@ -269,7 +294,7 @@ OUTPUT_TRANSFORM = "LOG10"
 # slices are written from this one list, in the same loop (see "8. Depth
 # slices" below), so keeping this in sync automatically keeps sensitivity
 # covering the same depths as resistivity.
-# DEPTH_SLICES_KM = [-3., -1., 1.0, 5.0, 9.0]  # TACNA
+# DEPTH_SLICES_KM = [-3., -1., 1.0, 5.0, 9.0]  # ubinas
 DEPTH_SLICES_KM = [-3., 1.0, 6.0, 11.0, 16.0, 21.0, 26.0, 31.0, 36]
 # --- Export the full native ModEM submesh as a flat point table, for
 # clustering ---
@@ -325,7 +350,7 @@ ILLEGAL_LOW_THRESHOLD = 1.0e-20
 # [trim_x0, trim_x1, trim_y0, trim_y1, trim_z0] — number of cells to drop
 # from the -x, +x, -y, +y faces and the top (z=0) face respectively.
 # Set all to 0 to keep the full model.
-# TRIM_PAD = [7, 7, 7, 7, 16]  # TACNA
+# TRIM_PAD = [7, 7, 7, 7, 16]  # ubinas
 TRIM_PAD = [7, 7, 7, 7, 0]
 
 # --- Geographic region of interest ---
@@ -352,8 +377,8 @@ UTM_HEMI = None  # "N" or "S"; None → infer from REFERENCE_LAT
 # =====================================================================
 
 # Input velocity model files
-FNAME_VP = "../seistomo/FD_vp_model.nc"
-FNAME_VS = "../seistomo/FD_vs_model.nc"
+FNAME_VP = "../../seistomo_data/FD_vp_model.nc"
+FNAME_VS = "../../seistomo_data/FD_vs_model.nc"
 # Density model (kg/m^3 or g/cm^3, as stored in the source file — this
 # script does not rescale it, only reprojects/crops/slices it exactly
 # like Vp/Vs). Expected on the same (lat, lon, depth) grid as FNAME_VP/
@@ -365,7 +390,7 @@ FNAME_VS = "../seistomo/FD_vs_model.nc"
 # *file* itself is still named FD_rho_model.nc on disk (matching the
 # FD_vp_model.nc / FD_vs_model.nc naming convention) — only this script's
 # internal variable/output naming has been disambiguated.
-FNAME_DENS = "../seistomo/FD_rho_model.nc"
+FNAME_DENS = "../../seistomo_data/FD_dens_model.nc"
 
 # Velocity subset geographic bounds
 # CROP_TO_REGION / TAR_LON / TAR_LAT now live in the SHARED SETTINGS
@@ -374,8 +399,8 @@ FNAME_DENS = "../seistomo/FD_rho_model.nc"
 # margins it does (must fully contain every VSLICES profile endpoint
 # defined in plot_seis.py, PROFILE_CD_LON/LAT etc.).
 
-# TAR_LON = [-70.79, -69.50]  # TACNA, superseded by SHARED SETTINGS above
-# TAR_LAT = [-18.34, -16.99]  # TACNA, superseded by SHARED SETTINGS above
+# TAR_LON = [-70.79, -69.50]  # ubinas, superseded by SHARED SETTINGS above
+# TAR_LAT = [-18.34, -16.99]  # ubinas, superseded by SHARED SETTINGS above
 # Lower bound was 0 (sea level), which silently discarded any above-sea-
 # level coverage the source model has (e.g. under a volcanic edifice) —
 # the same VSLICES zmin_km=-8.0 fix in plot_seis.py can't recover
@@ -386,13 +411,13 @@ FNAME_DENS = "../seistomo/FD_rho_model.nc"
 # don't extend that high — worth checking the printed depth range below
 # after re-running to see whether real coverage was gained or not.
 
-DEPTH_RANGE = [-8, 100]          # km
-# DEPTH_INDEX = [1, 5, 10, 15, 20, 25, 30]  # TACNA
+DEPTH_RANGE = [-8, 50]          # km
+# DEPTH_INDEX = [1, 5, 10, 15, 20, 25, 30]  # ubinas
 DEPTH_INDEX = [1, 5, 10, 15, 20, 25, 30, 35, 40]
 # Depth indices to export as per-depth UTM-km slices
 # Topo/bath geographic bounds (slightly wider than velocity subset)
-# MAP_LON = [-70.94, -69.25]  # TACNA
-# MAP_LAT = [-18.50, -16.80]  # TACNA
+# MAP_LON = [-70.94, -69.25]  # ubinas
+# MAP_LAT = [-18.50, -16.80]  # ubinas
 MAP_LON = [TAR_LON[0], TAR_LON[1]]
 MAP_LAT = [TAR_LAT[0], TAR_LAT[1]]
 
@@ -411,6 +436,92 @@ GEOTIFF_PATH = ""    # path to local GeoTIFF       (used when TOPO_SOURCE="geoti
 # =====================================================================
 # END PART B SETTINGS
 # =====================================================================
+
+
+# =====================================================================
+# PART C SETTINGS — FEMTIC mesh (tetrahedral resistivity model)
+# =====================================================================
+# Reads a FEMTIC mesh.dat + resistivity_block_iterX.dat directly (no
+# precompute step of its own on FEMTIC's side -- these are FEMTIC's own
+# native output files) and writes two derived NetCDF products consumed
+# downstream, replacing what interpolate.py's load_femtic_points() /
+# plot_femtic_mesh.py's load_femtic_mesh() used to do by re-reading and
+# re-deriving from the raw mesh/block files on every run:
+#   femtic_mesh_utm.nc       -- full node/connectivity topology, UTM
+#                                METRES (origin + depth offset already
+#                                applied), for plot_femtic_mesh.py's
+#                                plane-intersection slicing. Kept in
+#                                METRES, not km, so plane_intersect_tet's
+#                                eps=1e-9 degenerate-case tolerance (unit-
+#                                dependent, tuned/verified at metre scale)
+#                                keeps behaving exactly as before -- a
+#                                bare rescale to km would silently make
+#                                that tolerance 1000x more lenient.
+#   femtic_submesh_points.nc -- flat one-row-per-element point table,
+#                                UTM KM (easting/northing/depth), for
+#                                interpolate.py -- same schema as Part
+#                                A's modem_submesh_points.nc (excluded
+#                                elements kept as NaN + a `valid` flag,
+#                                not dropped, same air-cell-masking-
+#                                upstream convention as Part A).
+# Set EXPORT_FEMTIC = False to skip this part entirely (e.g. a site with
+# no FEMTIC run of its own).
+
+EXPORT_FEMTIC = True
+
+FEMTIC_DIR = "../femtic/"
+FEMTIC_MESH_FILE = "mesh.dat"
+FEMTIC_BLOCK_FILE = "resistivity_block_iter14.dat"
+
+# UTM METRES of the FEMTIC mesh's own local-coordinate origin (FEMTIC's
+# own utm_to_model() convention: model-local x/y = UTM easting/northing
+# minus this origin, axes aligned with UTM east/north, no rotation).
+#
+# None (default) = auto-estimate as the bounding-box centre of every
+# site in FEMTIC_SITES_DAT below, via tomomt.estimate_utm_origin() --
+# same UTM zone/hemisphere as this project's fixed EPSG:32719 convention
+# (see tomomt.py's own coordinate-transform section). Set both to an
+# explicit float instead to override (e.g. a value from the FEMTIC run's
+# own setup, or from tomomt.estimate_utm_origin()'s calibration-site
+# method run separately) -- an explicit override always wins over
+# FEMTIC_SITES_DAT.
+FEMTIC_ORIGIN_E_M = None
+FEMTIC_ORIGIN_N_M = None
+inversion_anchor =  [8189946, 300472] # NS EW ubinas 2025 
+
+FEMTIC_ORIGIN_E_M = inversion_anchor[1] #None
+FEMTIC_ORIGIN_N_M = inversion_anchor[0] #None
+
+# FEMTIC sitelist CSV (mt_make_sitelist.py's own output format: name,
+# lat, lon, elev, sitenum, easting, northing) used for the bounding-box
+# origin estimate above when FEMTIC_ORIGIN_E_M/N_M are None. Only read
+# in that case -- irrelevant once an explicit override is set.
+FEMTIC_SITES_DAT = "sites.dat"
+
+# Depth-axis calibration (km), added to FEMTIC's own z/1000 (z positive
+# downward, metres) -- only needed if the FEMTIC mesh's own z=0 datum
+# isn't exactly this project's z=0 reference (Part A's build_depth_axis_km()
+# ref_z). 0.0 = assume they already match, same safe-default policy as
+# this project's other unverified-until-checked calibration constants.
+FEMTIC_DEPTH_OFFSET_KM = 0.0
+
+# Which regions to exclude before export -- mirrors tomomt.read_model()'s
+# own parameters/semantics exactly (air region 0 and any flag==1 region
+# always excluded; region 1 additionally excluded if ocean-present).
+# include_fixed=True keeps every element (air/ocean/fixed included).
+FEMTIC_INCLUDE_FIXED = False
+FEMTIC_OCEAN = None   # None = auto-infer (tomomt._infer_ocean_present);
+                       # True/False = force ocean-present/-absent
+
+# =====================================================================
+# END PART C SETTINGS
+# =====================================================================
+
+
+def fempath(name):
+    """Join a bare filename onto FEMTIC_DIR (mesh.dat /
+    resistivity_block_iterX.dat, only used by Part C)."""
+    return tomomt.resolve_path(FEMTIC_DIR, name)
 
 
 # ------------------------------------------------------------------
@@ -1287,6 +1398,241 @@ def load_topo_geographic(lon_range, lat_range):
         )
 
 
+# ------------------------------------------------------------------
+# PART C HELPER FUNCTIONS — FEMTIC mesh
+# ------------------------------------------------------------------
+
+def _femtic_valid_mask(nreg, region_of_elem, region_flag, block_path, block,
+                        include_fixed, ocean_override):
+    """
+    Region-exclusion mask over elements -- air region 0 and any flag==1
+    region always excluded; region 1 additionally excluded if ocean-
+    present (auto-inferred via tomomt._infer_ocean_present() on region
+    1's own raw line unless ocean_override forces it) -- mirrors
+    tomomt.read_model()'s own semantics exactly, applied per ELEMENT via
+    region_of_elem rather than tomomt.read_model()'s one value per
+    region. include_fixed=True short-circuits to "keep everything".
+
+    Returns (valid, ocean_present) -- valid : bool ndarray, shape (nelem,).
+    """
+    n_total = len(region_of_elem)
+    if include_fixed:
+        return np.ones(n_total, dtype=bool), False
+
+    if ocean_override is not None:
+        ocean_present = bool(ocean_override)
+    elif nreg <= 1:
+        ocean_present = False
+    else:
+        nelem = int(block["nelem"])
+        with open(block_path, "r", errors="ignore") as f:
+            f.readline()               # "nelem nreg" header
+            for _ in range(nelem):
+                f.readline()            # element -> region mapping
+            f.readline()                # region 0 (air)
+            region1_line = f.readline()
+        ocean_present = tomomt._infer_ocean_present(region1_line, fmt=block["fmt"])
+
+    region_fixed = np.zeros(nreg, dtype=bool)
+    region_fixed[0] = True                   # air: always fixed
+    region_fixed |= (region_flag == 1)       # explicitly flagged fixed
+    if nreg > 1 and ocean_present:
+        region_fixed[1] = True               # ocean, if present
+    valid = ~region_fixed[region_of_elem]
+    return valid, ocean_present
+
+
+def save_femtic_mesh_utm(mesh_path, block_path, origin_e_m, origin_n_m,
+                          depth_offset_km, include_fixed, ocean_override,
+                          outfile):
+    """
+    Read a FEMTIC mesh.dat + resistivity_block_iterX.dat, apply the
+    air/ocean/fixed exclusion mask, shift node coordinates by the mesh's
+    own UTM origin (+ the depth-axis calibration, in metres) so
+    plot_femtic_mesh.py never needs to redo that shift itself, and write
+    the full node/connectivity topology to a NetCDF.
+
+    Node coordinates are kept in UTM METRES (not km) -- see PART C
+    SETTINGS' comment on why: plane_intersect_tet()'s eps=1e-9 degenerate-
+    case tolerance was tuned/verified at metre scale, and a bare rescale
+    to km would silently loosen it 1000x.
+
+    Returns (n_total, n_valid, ocean_present) for the run-summary print.
+    """
+    nodes, conn = tomomt.read_femtic_mesh(mesh_path)
+    block = tomomt.read_resistivity_block(block_path)
+    arrays = tomomt.build_element_arrays(
+        nodes=nodes, conn=conn,
+        region_of_elem=block["region_of_elem"],
+        region_rho=block["region_rho"],
+        region_rho_lower=block["region_rho_lower"],
+        region_rho_upper=block["region_rho_upper"],
+        region_n=block["region_n"],
+        region_flag=block["region_flag"],
+    )
+
+    nreg = int(block["nreg"])
+    region_of_elem = block["region_of_elem"]
+    region_flag = block["region_flag"]
+    n_total = len(region_of_elem)
+
+    valid, ocean_present = _femtic_valid_mask(
+        nreg, region_of_elem, region_flag, block_path, block,
+        include_fixed, ocean_override,
+    )
+
+    log10_rho = arrays["log10_resistivity"].copy()
+    valid &= np.isfinite(log10_rho)
+
+    nodes_utm = nodes.copy()
+    # FEMTIC mesh.dat convention: file column x = northing, file column y = easting
+    # (confirmed from femtic_viz.py lines 601-607: it explicitly swaps x<->y on read).
+    # tomomt.read_femtic_mesh() reads naively (no swap), so after read:
+    #   nodes[:, 0] = FEMTIC x = northing  (model-local)
+    #   nodes[:, 1] = FEMTIC y = easting   (model-local)
+    #   nodes[:, 2] = depth (positive down, unchanged)
+    # plot_femtic_mesh.py expects col0 = easting, col1 = northing (its _free_e_km uses
+    # [:, 0] and _free_n_km uses [:, 1]; depth-slice polygons plot [:, 0] on the easting
+    # axis and [:, 1] on the northing axis).  We must therefore swap axes 0 and 1 and
+    # add the matching origin offset so the stored array is [easting, northing, depth]:
+    nodes_utm[:, 0] = nodes[:, 1] + origin_e_m   # easting  = FEMTIC y + origin_E
+    nodes_utm[:, 1] = nodes[:, 0] + origin_n_m   # northing = FEMTIC x + origin_N
+    nodes_utm[:, 2] += depth_offset_km * 1e3      # km -> m, same sign convention (down = +)
+
+    ds = xr.Dataset(
+        {
+            "node_coords": (
+                ("node", "xyz"), nodes_utm.astype(np.float64),
+                {"units": "m", "long_name": "UTM easting/northing, depth (positive down) "
+                 "[col0=easting, col1=northing, col2=depth]"},
+            ),
+            "conn": (
+                ("elem", "vertex"), conn.astype(np.int32),
+                {"long_name": "tetrahedron -> node index (0-based)"},
+            ),
+            "region_of_elem": (
+                "elem", region_of_elem.astype(np.int32),
+                {"long_name": "FEMTIC region index of each element"},
+            ),
+            "log10_resistivity": (
+                "elem", log10_rho.astype(np.float32),
+                {"long_name": "log10 resistivity", "units": "log10(Ohm.m)"},
+            ),
+            "valid": (
+                "elem", valid.astype(np.int8),
+                {"long_name": "1 if element kept (not air/ocean/other-fixed), else 0"},
+            ),
+        },
+        attrs={
+            "description": (
+                "FEMTIC tetrahedral mesh, full node/connectivity topology, "
+                "in UTM metres (mesh's own local origin + depth-axis "
+                "calibration already applied). For plot_femtic_mesh.py's "
+                "plane-intersection slicing -- see that script's "
+                "depth_slice_polygons()/profile_slice_polygons()."
+            ),
+            "mesh_file": os.path.basename(mesh_path),
+            "block_file": os.path.basename(block_path),
+            "origin_e_m": float(origin_e_m),
+            "origin_n_m": float(origin_n_m),
+            "depth_offset_km": float(depth_offset_km),
+            "nreg": nreg,
+            "ocean_present": int(ocean_present),
+            "include_fixed": int(include_fixed),
+            "n_elements_total": int(n_total),
+            "n_elements_valid": int(valid.sum()),
+        },
+    )
+    safe_to_netcdf(ds, outfile)
+    return n_total, int(valid.sum()), ocean_present
+
+
+def save_femtic_submesh_points(mesh_path, block_path, origin_e_m, origin_n_m,
+                                depth_offset_km, include_fixed, ocean_override,
+                                outfile):
+    """
+    Read the same FEMTIC mesh + resistivity block as
+    save_femtic_mesh_utm(), collapse each element to its own centroid,
+    and write a flat one-row-per-element point table (easting_km,
+    northing_km, depth_km, resistivity, valid) -- same schema and same
+    NaN-not-dropped convention as Part A's save_submesh_table() /
+    modem_submesh_points.nc -- for interpolate.py's point-cloud
+    interpolation pipeline.
+    """
+    nodes, conn = tomomt.read_femtic_mesh(mesh_path)
+    block = tomomt.read_resistivity_block(block_path)
+    arrays = tomomt.build_element_arrays(
+        nodes=nodes, conn=conn,
+        region_of_elem=block["region_of_elem"],
+        region_rho=block["region_rho"],
+        region_rho_lower=block["region_rho_lower"],
+        region_rho_upper=block["region_rho_upper"],
+        region_n=block["region_n"],
+        region_flag=block["region_flag"],
+    )
+
+    nreg = int(block["nreg"])
+    region_of_elem = block["region_of_elem"]
+    region_flag = block["region_flag"]
+
+    valid, ocean_present = _femtic_valid_mask(
+        nreg, region_of_elem, region_flag, block_path, block,
+        include_fixed, ocean_override,
+    )
+
+    log10_rho = arrays["log10_resistivity"].copy()
+    valid &= np.isfinite(log10_rho)
+
+    centroid = arrays["centroid"]  # (nelem, 3) model-local metres
+    # FEMTIC mesh.dat: col 0 = northing (FEMTIC x), col 1 = easting (FEMTIC y).
+    # Swap axes to geographic convention (easting, northing) matching the rest of the
+    # pipeline (modem_submesh_points.nc / interpolate.py use easting/northing columns).
+    easting_km  = (centroid[:, 1] + origin_e_m) / 1e3   # FEMTIC y → easting
+    northing_km = (centroid[:, 0] + origin_n_m) / 1e3   # FEMTIC x → northing
+    depth_km = centroid[:, 2] / 1e3 + depth_offset_km
+
+    resistivity_out = np.where(valid, log10_rho, np.nan).astype(np.float32)
+
+    ds = xr.Dataset(
+        {
+            "easting": (
+                "point", easting_km.astype(np.float32),
+                {"units": "km", "long_name": "UTM easting"},
+            ),
+            "northing": (
+                "point", northing_km.astype(np.float32),
+                {"units": "km", "long_name": "UTM northing"},
+            ),
+            "depth": (
+                "point", depth_km.astype(np.float32),
+                {"units": "km", "long_name": "Depth below surface", "positive": "down"},
+            ),
+            "resistivity": (
+                "point", resistivity_out,
+                {"long_name": "log10 resistivity", "units": "log10(Ohm.m)"},
+            ),
+            "valid": (
+                "point", valid.astype(np.int8),
+                {"long_name": "1 if resistivity is finite (not air/ocean/other-fixed), else 0"},
+            ),
+        },
+        attrs={
+            "description": (
+                "FEMTIC tetrahedral mesh, one row per element (centroid + "
+                "log10 resistivity), UTM km. Excluded elements (air/ocean/"
+                "other-fixed) kept as NaN with valid=0, same convention as "
+                "Part A's modem_submesh_points.nc -- intended for "
+                "interpolate.py's point-cloud interpolation pipeline."
+            ),
+            "mesh_file": os.path.basename(mesh_path),
+            "block_file": os.path.basename(block_path),
+            "origin_e_m": float(origin_e_m),
+            "origin_n_m": float(origin_n_m),
+            "depth_offset_km": float(depth_offset_km),
+        },
+    )
+    safe_to_netcdf(ds, outfile)
+    return int(valid.sum()), int(len(valid))
 
 
 # ==================================================================
@@ -1807,3 +2153,53 @@ for d_index in DEPTH_INDEX:
     slice_to_utm_km_nc(dens["data"].isel(depth=d_index), outpath(f"{SITE_PREFIX}_dens_utm_{tag}.nc"))
 
 print("\nDone (Part B). All seismic + density UTM-km grids ready.")
+
+# ==================================================================
+# PART C — FEMTIC mesh processing
+# ==================================================================
+if EXPORT_FEMTIC:
+    femtic_origin_e_m = FEMTIC_ORIGIN_E_M
+    femtic_origin_n_m = FEMTIC_ORIGIN_N_M
+
+    if femtic_origin_e_m is None or femtic_origin_n_m is None:
+        print("\n=== Estimating FEMTIC mesh UTM origin from sitelist ===")
+        femtic_sites_path = fempath(FEMTIC_SITES_DAT)
+        femtic_origin_e_m, femtic_origin_n_m = tomomt.estimate_utm_origin(
+            [], observe_file=None, zone=19, northern=False,
+            site_dat=femtic_sites_path, out=True,
+        )
+
+    print("\n=== Reading FEMTIC mesh + resistivity block ===")
+    femtic_mesh_path = fempath(FEMTIC_MESH_FILE)
+    femtic_block_path = fempath(FEMTIC_BLOCK_FILE)
+    print(f"  mesh : {femtic_mesh_path}")
+    print(f"  block: {femtic_block_path}")
+
+    n_total, n_valid, ocean_present = save_femtic_mesh_utm(
+        femtic_mesh_path, femtic_block_path,
+        origin_e_m=femtic_origin_e_m, origin_n_m=femtic_origin_n_m,
+        depth_offset_km=FEMTIC_DEPTH_OFFSET_KM,
+        include_fixed=FEMTIC_INCLUDE_FIXED, ocean_override=FEMTIC_OCEAN,
+        outfile=outpath("femtic_mesh_utm.nc"),
+    )
+    excluded = ", ".join(
+        s for s in ("air", "ocean" if ocean_present else None, "other-fixed")
+        if s
+    ) if not FEMTIC_INCLUDE_FIXED else "none"
+    print(f"  {n_valid}/{n_total} elements kept (excluded: {excluded})")
+    print(f"  Saved: {outpath('femtic_mesh_utm.nc')}")
+
+    n_valid_pts, n_total_pts = save_femtic_submesh_points(
+        femtic_mesh_path, femtic_block_path,
+        origin_e_m=femtic_origin_e_m, origin_n_m=femtic_origin_n_m,
+        depth_offset_km=FEMTIC_DEPTH_OFFSET_KM,
+        include_fixed=FEMTIC_INCLUDE_FIXED, ocean_override=FEMTIC_OCEAN,
+        outfile=outpath("femtic_submesh_points.nc"),
+    )
+    print(f"  {n_valid_pts}/{n_total_pts} points valid")
+    print(f"  Saved: {outpath('femtic_submesh_points.nc')}")
+
+    print("\nDone (Part C). FEMTIC mesh NetCDFs ready.")
+else:
+    print("\nEXPORT_FEMTIC = False -- skipping Part C (FEMTIC mesh).")
+
